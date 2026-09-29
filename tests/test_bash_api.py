@@ -123,3 +123,21 @@ Path("OSZICAR").write_text("")
             encoding="utf-8",
         )
         assert "incomplete_outcar" not in {item.code for item in diagnose_vasp_files(tmp_path)}
+
+
+def test_a_stale_outcar_does_not_stop_a_new_run(tmp_path: Path) -> None:
+    (tmp_path / "OUTCAR").write_text(" LAPACK: Routine ZPOTRF failed!\n", encoding="utf-8")
+    (tmp_path / "CONTCAR").write_text("kept\n", encoding="utf-8")
+    program = tmp_path / "fake-vasp.py"
+    program.write_text(
+        """import time
+from pathlib import Path
+time.sleep(0.5)
+Path("OUTCAR").write_text("vasp.6.4\\nGeneral timing and accounting informations for this job:\\n")
+""",
+        encoding="utf-8",
+    )
+    report = run_vasp([sys.executable, str(program)], directory=tmp_path, termination_grace=0.1)
+    assert report.classification == "completed", report.diagnostics
+    assert report.process.returncode == 0
+    assert (tmp_path / "CONTCAR").read_text(encoding="utf-8") == "kept\n"

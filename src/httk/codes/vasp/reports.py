@@ -104,6 +104,10 @@ def run_vasp(
 ) -> VaspRunReport:
     """Run VASP with live VASP-5/6 diagnostics and a structured report.
 
+    The followed ``OUTCAR`` and ``OSZICAR`` are removed before VASP starts, so a
+    stale file from an earlier run cannot replay its diagnostics into this one;
+    VASP rewrites both anyway. ``CONTCAR`` and the run report are not touched.
+
     :param argv: Execute this VASP command argument vector.
     :param directory: Run VASP in this directory.
     :param timeout: Stop the process after this duration when set.
@@ -113,13 +117,13 @@ def run_vasp(
     """
 
     root = Path(directory).resolve()
-    supervisor = ProcessSupervisor(
-        monitors=(_VaspMonitor(),),
-        follow=(
-            FollowSource(root / "OSZICAR", "OSZICAR"),
-            FollowSource(root / "OUTCAR", "OUTCAR"),
-        ),
+    follow = (
+        FollowSource(root / "OSZICAR", "OSZICAR"),
+        FollowSource(root / "OUTCAR", "OUTCAR"),
     )
+    for source in follow:
+        source.path.unlink(missing_ok=True)
+    supervisor = ProcessSupervisor(monitors=(_VaspMonitor(),), follow=follow)
     process = supervisor.run(
         argv,
         timeout=timeout,

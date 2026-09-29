@@ -51,7 +51,8 @@ The package covers:
   rattling, and {py:func}`~httk.codes.vasp.contcar_to_poscar`.
 - **Execution and diagnosis** — {py:func}`~httk.codes.vasp.run_vasp` supervises
   one VASP process and returns a classified
-  {py:class}`~httk.codes.vasp.VaspRunReport`;
+  {py:class}`~httk.codes.vasp.VaspRunReport`, removing a stale `OUTCAR` and
+  `OSZICAR` first so an earlier run's errors cannot stop the new one;
   {py:func}`~httk.codes.vasp.diagnose_vasp_files` reads VASP 5 and 6 output into
   structured diagnostics without changing inputs;
   {py:func}`~httk.codes.vasp.validate_vasp_workdir` checks VASP's conservative
