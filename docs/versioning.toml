@@ -1,0 +1,17 @@
+[site]
+slug = "httk-workflow-vasp"
+repository-url = "https://github.com/httk/httk-workflow-vasp"
+main-branch = "main"
+import-roots = ["httk/codes", "httk/codes/vasp", "httk/registry"]
+
+[[internal-dependency]]
+distribution = "httk-core"
+slug = "httk-core"
+repository-url = "https://github.com/httk/httk-core"
+main-branch = "main"
+
+[[internal-dependency]]
+distribution = "httk-workflow"
+slug = "httk-workflow"
+repository-url = "https://github.com/httk/httk-workflow"
+main-branch = "main"

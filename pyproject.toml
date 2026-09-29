@@ -1,0 +1,135 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "httk-workflow-vasp"
+version = "0.1.0"
+description = "VASP support for httk₂ workflows."
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [{ name = "Rickard Armiento", email = "gitcommits@armiento.net" }]
+dependencies = [
+  "httk-core>=2.1.2,<3",
+  "httk-workflow>=2.1.1,<3",
+]
+keywords = [
+  "Materials Discovery",
+  "Materials Informatics",
+  "Materials Science",
+  "VASP",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Science/Research",
+  # POSIX like httk-workflow: supervised runs reap process groups, and the
+  # package ships a Bash API it executes.
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Unix Shell",
+  "Topic :: Scientific/Engineering :: Chemistry",
+  "Topic :: Scientific/Engineering :: Physics",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://httk.org"
+Documentation = "https://docs.httk.org/httk-workflow-vasp/"
+Repository = "https://github.com/httk/httk-workflow-vasp"
+Issues = "https://github.com/httk/httk-workflow-vasp/issues"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-xdist>=3.6",
+  "ruff>=0.16,<0.17",
+  "pyright",
+  "mypy",
+  "pydoclint>=0.9,<1"
+]
+docs = [
+  "sphinx",
+  "furo",
+  "myst-parser",
+  "myst-nb",
+  "sphinx-autodoc-typehints",
+  "sphinx-copybutton",
+  "sphinx-autoapi"
+]
+release = [
+  "build>=1.2",
+  "twine>=6.0",
+]
+default = []
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["httk.codes*", "httk.registry.codes*"]
+namespaces = true
+
+[tool.setuptools.package-data]
+"httk.codes.vasp" = ["py.typed", "*.sh"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Match the host CPU count, capped at 16, as in httk-workflow.
+# An extended run overrides the marker selection with `-m ""`.
+addopts = "-n auto --maxprocesses 16 --dist loadgroup -m 'not extended'"
+markers = [
+  "slow: drives real processes and waits on them; deselect with -m 'not slow'",
+  "extended: full-depth test case; selected only by the extended test profile",
+  "xdist_group(name): schedule related timing-sensitive tests on one worker",
+]
+
+[tool.ruff]
+target-version = "py312"
+src = ["src", "tests"]
+line-length = 120
+
+[tool.ruff.lint]
+# TRY002: raising plain Exception is accepted httk style.
+# TRY004: the ValueError/TypeError choice is public API; do not churn it.
+# BLE001: broad excepts deliberately isolate plugin/loader/handler failures.
+ignore = ["TRY002", "TRY004", "BLE001"]
+
+[tool.ruff.format]
+# preserve replaces black's skip-string-normalization: existing quote styles are kept.
+quote-style = "preserve"
+
+[tool.pyright]
+pythonVersion = "3.12"
+include = ["src", "tests"]
+extraPaths = ["src", "../httk-core/src", "../httk-workflow/src"]
+venvPath = ".."
+venv = ".venv"
+reportMissingImports = true
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "tests"]
+mypy_path = ["src", "tests"]
+namespace_packages = true
+explicit_package_bases = true
+warn_unused_ignores = true
+
+# Optional peer integrations remain type-checked whenever those distributions
+# are installed; their absence must not break this module's own release gates.
+[[tool.mypy.overrides]]
+module = ["httk.atomistic", "httk.atomistic.*"]
+ignore_missing_imports = true
+
+[tool.pydoclint]
+style = "sphinx"
+arg-type-hints-in-docstring = false
+check-return-types = false
+check-yield-types = false
+check-class-attributes = false
+skip-checking-raises = true
