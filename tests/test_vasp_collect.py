@@ -1,17 +1,15 @@
-"""The collect-hook helpers locate result files in workdirs and published data, and read them."""
+"""The collect-hook helpers read a structure and a total energy from VASP files."""
 
 import runpy
-from dataclasses import replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import pytest
 
 pytest.importorskip("httk.atomistic")
 
 import httk.core
-from httk.workflow.collecting import JobRecord
 
-from httk.codes.vasp.collect import job_parameter, read_structure, read_total_energy, result_file
+from httk.codes.vasp.collect import read_structure, read_total_energy
 
 _POSCAR = """silicon
 1.0
@@ -38,80 +36,10 @@ _OUTCAR = """ vasp.5.2.12 synthetic
 """
 
 
-def _record(root: Path) -> JobRecord:
-    return JobRecord(
-        workspace_root=root,
-        workspace_id="ws",
-        job_id="12345678-1234-4234-8234-123456789abc",
-        job_key="job--12345678-1234-4234-8234-123456789abc",
-        job={"workflow": "vasp.relax"},
-        runner_provenance=None,
-        state="succeeded",
-        failure=None,
-        placement=PurePosixPath("jobs"),
-        payload_path=PurePosixPath("jobs/job--12345678-1234-4234-8234-123456789abc"),
-        workdir_path=None,
-        data_path=PurePosixPath("data"),
-        data_generation=1,
-        provenance={},
-        runner_steps=None,
-        children={},
-        declarations={},
-    )
-
-
 def _write(root: Path, *parts: str) -> None:
     directory = root.joinpath(*parts[:-1])
     directory.mkdir(parents=True, exist_ok=True)
     (directory / parts[-1]).write_text(_POSCAR if parts[-1] == "CONTCAR" else _OUTCAR, encoding="utf-8")
-
-
-def _workdir_record(root: Path) -> JobRecord:
-    return replace(_record(root), workdir_path=PurePosixPath("run"), data_path=None, data_generation=None)
-
-
-def test_published_data_is_read_below_the_data_prefix(tmp_path: Path) -> None:
-    _write(tmp_path / "data" / "vasp", "OUTCAR")
-    assert result_file(_record(tmp_path), "OUTCAR", data_prefix="vasp") == tmp_path / "data" / "vasp" / "OUTCAR"
-
-
-@pytest.mark.parametrize("prefix", ("", "custom/results"))
-def test_a_published_name_replaces_the_workdir_name_only_in_data(tmp_path: Path, prefix: str) -> None:
-    _write(tmp_path / "data" / prefix / "static", "OUTCAR")
-    _write(tmp_path / "run", "OUTCAR")
-    published = replace(_record(tmp_path), workdir_path=PurePosixPath("run"))
-    path = result_file(published, "OUTCAR", data_prefix=prefix, published="static/OUTCAR")
-    assert path == tmp_path / "data" / prefix / "static" / "OUTCAR"
-    path = result_file(_workdir_record(tmp_path), "OUTCAR", data_prefix=prefix, published="static/OUTCAR")
-    assert path == tmp_path / "run" / "OUTCAR"
-
-
-def test_missing_file_names_job_identity(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match=r"ws:12345678-1234-4234-8234-123456789abc.*OUTCAR"):
-        result_file(_record(tmp_path), "OUTCAR", data_prefix="vasp")
-
-
-@pytest.mark.parametrize("generation", (None, 1))
-def test_transactional_job_does_not_fall_back_to_unpublished_workdir(tmp_path: Path, generation: int | None) -> None:
-    _write(tmp_path / "run", "CONTCAR")
-    record = replace(_record(tmp_path), workdir_path=PurePosixPath("run"), data_generation=generation)
-    with pytest.raises(ValueError, match="expected published data file"):
-        result_file(record, "CONTCAR", data_prefix="vasp")
-
-
-@pytest.mark.parametrize("workdir", (None, PurePosixPath("run")))
-def test_missing_workdir_result_names_job_identity(tmp_path: Path, workdir: PurePosixPath | None) -> None:
-    record = replace(_record(tmp_path), workdir_path=workdir, data_path=None, data_generation=None)
-    with pytest.raises(ValueError, match=r"ws:12345678-1234-4234-8234-123456789abc.*CONTCAR"):
-        result_file(record, "CONTCAR")
-
-
-def test_job_parameter_reads_strings_and_defaults_otherwise(tmp_path: Path) -> None:
-    record = replace(_record(tmp_path), job={"parameters": {"data_prefix": "", "timeout": 5}})
-    assert job_parameter(record, "data_prefix", "vasp") == ""
-    assert job_parameter(record, "timeout", "x") == "x"
-    assert job_parameter(record, "absent", "vasp") == "vasp"
-    assert job_parameter(_record(tmp_path), "data_prefix", "vasp") == "vasp"
 
 
 def test_read_structure_and_total_energy(tmp_path: Path) -> None:
