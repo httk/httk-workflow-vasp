@@ -1,4 +1,4 @@
-"""VASP collectors support persistent workdirs and opted-in published data."""
+"""The collect-hook helpers locate result files in workdirs and published data, and read them."""
 
 import runpy
 from dataclasses import replace
@@ -11,11 +11,7 @@ pytest.importorskip("httk.atomistic")
 import httk.core
 from httk.workflow.collecting import JobRecord
 
-from httk.codes.vasp.collect import (
-    collect_vasp_relax,
-    collect_vasp_relax_static,
-    collect_vasp_static,
-)
+from httk.codes.vasp.collect import job_parameter, read_structure, read_total_energy, result_file
 
 _POSCAR = """silicon
 1.0
@@ -42,13 +38,13 @@ _OUTCAR = """ vasp.5.2.12 synthetic
 """
 
 
-def _record(root: Path, workflow: str) -> JobRecord:
+def _record(root: Path) -> JobRecord:
     return JobRecord(
         workspace_root=root,
         workspace_id="ws",
         job_id="12345678-1234-4234-8234-123456789abc",
         job_key="job--12345678-1234-4234-8234-123456789abc",
-        job={"workflow": workflow},
+        job={"workflow": "vasp.relax"},
         runner_provenance=None,
         state="succeeded",
         failure=None,
@@ -70,97 +66,76 @@ def _write(root: Path, *parts: str) -> None:
     (directory / parts[-1]).write_text(_POSCAR if parts[-1] == "CONTCAR" else _OUTCAR, encoding="utf-8")
 
 
-def test_relax_returns_declared_roles(tmp_path: Path) -> None:
-    _write(tmp_path / "data", "vasp", "CONTCAR")
-    _write(tmp_path / "data", "vasp", "OUTCAR")
-    outputs = collect_vasp_relax(_record(tmp_path, "httk.vasp.relax"))
-    assert set(outputs) == {"relaxed_structure", "total_energy"}
-    assert isinstance(outputs["total_energy"], httk.core.DataRecord)
+def _workdir_record(root: Path) -> JobRecord:
+    return replace(_record(root), workdir_path=PurePosixPath("run"), data_path=None, data_generation=None)
 
 
-def test_static_returns_only_energy(tmp_path: Path) -> None:
-    _write(tmp_path / "data", "vasp", "OUTCAR")
-    outputs = collect_vasp_static(_record(tmp_path, "httk.vasp.static"))
-    assert set(outputs) == {"total_energy"}
+def test_published_data_is_read_below_the_data_prefix(tmp_path: Path) -> None:
+    _write(tmp_path / "data" / "vasp", "OUTCAR")
+    assert result_file(_record(tmp_path), "OUTCAR", data_prefix="vasp") == tmp_path / "data" / "vasp" / "OUTCAR"
 
 
-def test_relax_static_uses_two_output_layouts(tmp_path: Path) -> None:
-    _write(tmp_path / "data", "relax", "CONTCAR")
-    _write(tmp_path / "data", "static", "OUTCAR")
-    outputs = collect_vasp_relax_static(_record(tmp_path, "httk.vasp.relax-static"))
-    assert set(outputs) == {"relaxed_structure", "total_energy"}
+@pytest.mark.parametrize("prefix", ("", "custom/results"))
+def test_a_published_name_replaces_the_workdir_name_only_in_data(tmp_path: Path, prefix: str) -> None:
+    _write(tmp_path / "data" / prefix / "static", "OUTCAR")
+    _write(tmp_path / "run", "OUTCAR")
+    published = replace(_record(tmp_path), workdir_path=PurePosixPath("run"))
+    path = result_file(published, "OUTCAR", data_prefix=prefix, published="static/OUTCAR")
+    assert path == tmp_path / "data" / prefix / "static" / "OUTCAR"
+    path = result_file(_workdir_record(tmp_path), "OUTCAR", data_prefix=prefix, published="static/OUTCAR")
+    assert path == tmp_path / "run" / "OUTCAR"
 
 
 def test_missing_file_names_job_identity(tmp_path: Path) -> None:
-    _write(tmp_path / "data", "vasp", "CONTCAR")
     with pytest.raises(ValueError, match=r"ws:12345678-1234-4234-8234-123456789abc.*OUTCAR"):
-        collect_vasp_relax(_record(tmp_path, "httk.vasp.relax"))
-
-
-@pytest.mark.parametrize("data_mode", ("none", "transactional"))
-@pytest.mark.parametrize("prefix", ("", "custom/results"))
-@pytest.mark.parametrize("workflow", ("relax", "relax-bash", "static", "relax-static"))
-def test_result_layouts_respect_data_mode_and_prefix(
-    tmp_path: Path, data_mode: str, prefix: str, workflow: str
-) -> None:
-    collectors = {
-        "relax": collect_vasp_relax,
-        "relax-bash": collect_vasp_relax,
-        "static": collect_vasp_static,
-        "relax-static": collect_vasp_relax_static,
-    }
-    record = replace(
-        _record(tmp_path, f"httk.vasp.{workflow}"),
-        job={"workflow": f"httk.vasp.{workflow}", "parameters": {"data_prefix": prefix}},
-        workdir_path=PurePosixPath("run"),
-        data_path=PurePosixPath("data") if data_mode == "transactional" else None,
-        data_generation=1 if data_mode == "transactional" else None,
-    )
-    root = tmp_path / "data" / prefix if data_mode == "transactional" else tmp_path / "run"
-    structure_root = root / "relax" if workflow == "relax-static" else root
-    energy_root = root / "static" if workflow == "relax-static" and data_mode == "transactional" else root
-    _write(structure_root, "CONTCAR")
-    _write(energy_root, "OUTCAR")
-    if workflow == "relax-static":
-        # The archived relaxation energy must not become the static result.
-        _write(root / "relax", "OUTCAR")
-        (root / "relax" / "OUTCAR").write_text(_OUTCAR.replace("-27.09328752", "-20.0"))
-    outputs = collectors[workflow](record)
-    roles = {"total_energy"} if workflow == "static" else {"relaxed_structure", "total_energy"}
-    assert set(outputs) == roles
-    energy = outputs["total_energy"]
-    assert isinstance(energy, httk.core.DataRecord)
-    assert energy.value == pytest.approx(-27.09328752)
+        result_file(_record(tmp_path), "OUTCAR", data_prefix="vasp")
 
 
 @pytest.mark.parametrize("generation", (None, 1))
-def test_transactional_collector_does_not_fall_back_to_unpublished_workdir(
-    tmp_path: Path, generation: int | None
-) -> None:
+def test_transactional_job_does_not_fall_back_to_unpublished_workdir(tmp_path: Path, generation: int | None) -> None:
     _write(tmp_path / "run", "CONTCAR")
-    _write(tmp_path / "run", "OUTCAR")
-    record = replace(
-        _record(tmp_path, "httk.vasp.relax"), workdir_path=PurePosixPath("run"), data_generation=generation
-    )
+    record = replace(_record(tmp_path), workdir_path=PurePosixPath("run"), data_generation=generation)
     with pytest.raises(ValueError, match="expected published data file"):
-        collect_vasp_relax(record)
+        result_file(record, "CONTCAR", data_prefix="vasp")
 
 
 @pytest.mark.parametrize("workdir", (None, PurePosixPath("run")))
 def test_missing_workdir_result_names_job_identity(tmp_path: Path, workdir: PurePosixPath | None) -> None:
-    record = replace(_record(tmp_path, "httk.vasp.relax"), workdir_path=workdir, data_path=None, data_generation=None)
+    record = replace(_record(tmp_path), workdir_path=workdir, data_path=None, data_generation=None)
     with pytest.raises(ValueError, match=r"ws:12345678-1234-4234-8234-123456789abc.*CONTCAR"):
-        collect_vasp_relax(record)
+        result_file(record, "CONTCAR")
+
+
+def test_job_parameter_reads_strings_and_defaults_otherwise(tmp_path: Path) -> None:
+    record = replace(_record(tmp_path), job={"parameters": {"data_prefix": "", "timeout": 5}})
+    assert job_parameter(record, "data_prefix", "vasp") == ""
+    assert job_parameter(record, "timeout", "x") == "x"
+    assert job_parameter(record, "absent", "vasp") == "vasp"
+    assert job_parameter(_record(tmp_path), "data_prefix", "vasp") == "vasp"
+
+
+def test_read_structure_and_total_energy(tmp_path: Path) -> None:
+    _write(tmp_path, "CONTCAR")
+    _write(tmp_path, "OUTCAR")
+    assert type(read_structure(tmp_path / "CONTCAR")).__name__ == "UnitcellStructureView"
+    energy = read_total_energy(tmp_path / "OUTCAR")
+    assert isinstance(energy, httk.core.DataRecord)
+    assert energy.value == pytest.approx(-27.09328752)
+
+
+def test_an_outcar_without_final_energy_is_refused(tmp_path: Path) -> None:
+    (tmp_path / "OUTCAR").write_text(" vasp.5.2.12 synthetic\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="cannot construct a total energy"):
+        read_total_energy(tmp_path / "OUTCAR")
 
 
 def test_the_mock_vasp_outcar_reports_its_last_ionic_energy(tmp_path: Path) -> None:
     """Each ionic step of the example mock repeats the header, so the final energy is the last one."""
 
     mock = runpy.run_path(str(Path(__file__).with_name("mock_vasp.py")))
-    outcar = tmp_path / "data" / "vasp" / "OUTCAR"
-    outcar.parent.mkdir(parents=True)
+    outcar = tmp_path / "OUTCAR"
     outcar.write_text(mock["_OUTCAR"], encoding="utf-8")
-    energy = collect_vasp_static(_record(tmp_path, "httk.vasp.static"))["total_energy"]
+    energy = read_total_energy(outcar)
     assert isinstance(energy, httk.core.DataRecord)
     assert energy.value == pytest.approx(-10.5)
 

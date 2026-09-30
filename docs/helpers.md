@@ -143,13 +143,39 @@ ladder, including its ZHEGV recovery, in full.
 
 ## Collect
 
-{py:mod}`httk.codes.vasp.collect` provides the result collectors of the
-workflows-vasp packages: {py:func}`~httk.codes.vasp.collect.collect_vasp_relax`
-(relaxed structure and total energy),
-{py:func}`~httk.codes.vasp.collect.collect_vasp_static` (total energy) and
-{py:func}`~httk.codes.vasp.collect.collect_vasp_relax_static` (relaxed structure
-and the static stage's energy). Each takes one
-{py:class}`~httk.workflow.collecting.JobRecord` and reads the job's committed data
-when it has transactional data, or its persistent workdir otherwise; a
-transactional job without committed data fails rather than falling back to
-unpublished files. They need *httk-atomistic* for the VASP file readers.
+{py:mod}`httk.codes.vasp.collect` holds the building blocks of a VASP
+workflow's collect hook. The hook itself decides which files hold its outputs,
+since that is what distinguishes one workflow from another; the helpers locate
+and read them:
+
+* {py:func}`~httk.codes.vasp.collect.result_file` locates one result file of a
+  {py:class}`~httk.workflow.collecting.JobRecord`: in the job's committed data
+  when it has transactional data (below its `data_prefix`, and under another
+  name when the runner published it under one), in its persistent workdir
+  otherwise. A transactional job without committed data fails rather than
+  falling back to unpublished files.
+* {py:func}`~httk.codes.vasp.collect.read_structure` reads a CONTCAR (or any
+  other VASP structure file) as a structure, and
+  {py:func}`~httk.codes.vasp.collect.read_total_energy` reads the final energy
+  of an OUTCAR as a `total_energy` property record. Both need *httk-atomistic*
+  for the VASP file readers.
+* {py:func}`~httk.codes.vasp.collect.job_parameter` reads a string job
+  parameter such as `data_prefix`.
+
+The collect hook of the relax-then-static workflow of workflows-vasp shows all
+of them; its relaxation is archived under `relax/` in the workdir while the
+static stage runs in the workdir itself, and `publish` puts the stages under
+`relax/` and `static/`:
+
+```python
+from httk.codes.vasp.collect import job_parameter, read_structure, read_total_energy, result_file
+
+
+def collect(record):
+    prefix = job_parameter(record, "data_prefix", "")
+    return {
+        "relaxed_structure": read_structure(result_file(record, "relax/CONTCAR", data_prefix=prefix)),
+        # Not relax/OUTCAR: the energy is the single point's, of the relaxed cell.
+        "total_energy": read_total_energy(result_file(record, "OUTCAR", data_prefix=prefix, published="static/OUTCAR")),
+    }
+```
