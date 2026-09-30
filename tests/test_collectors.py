@@ -2,6 +2,8 @@
 
 import bz2
 import gzip
+import logging
+import re
 import runpy
 import shutil
 from pathlib import Path
@@ -14,15 +16,27 @@ from httk.core.register import known_collectors
 from httk.core.storage import content_id
 from httk.workflow import claims, collect_tree
 
+from httk.codes.vasp.collect import structure_precision
+
 _POSCAR = "silicon\n1.0\n2.0 0.0 0.0\n0.0 2.0 0.0\n0.0 0.0 2.0\nSi\n2\nDirect\n0.0 0.0 0.0\n0.5 0.5 0.5\n"
 _OUTCAR = runpy.run_path(str(Path(__file__).with_name("mock_vasp.py")))["_OUTCAR"]
 _INCAR = "IBRION = 2\nNSW = 99\n"
 _ENERGY = -10.5
 
 
-def _calc(directory: Path, *, nsw: int = 99, ibrion: int = 2, incar: str = _INCAR, contcar: bool = True) -> Path:
+def _calc(
+    directory: Path,
+    *,
+    nsw: int = 99,
+    ibrion: int = 2,
+    incar: str = _INCAR,
+    contcar: bool = True,
+    echo: dict[str, str] | None = None,
+) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     outcar = _OUTCAR.replace("NSW    =     99", f"NSW    ={nsw:7d}").replace("IBRION =      2", f"IBRION ={ibrion:7d}")
+    for key, value in (echo or {}).items():
+        outcar = re.sub(rf"(?m)^   {key} *=.*$", f"   {key:<6} = {value}", outcar)
     (directory / "OUTCAR").write_text(outcar, encoding="utf-8")
     (directory / "POSCAR").write_text(_POSCAR, encoding="utf-8")
     (directory / "INCAR").write_text(incar, encoding="utf-8")
@@ -109,3 +123,22 @@ def test_an_unchanged_relaxation_still_collects(tmp_path: Path) -> None:
     assert item.missing_collector is None
     assert content_id(item.outputs["relaxed_structure"]) == content_id(item.inputs["initial_structure"])
     assert item.outputs["total_energy"].value == pytest.approx(_ENERGY)  # type: ignore[attr-defined]
+
+
+def test_structure_precision_follows_the_convergence_settings(tmp_path: Path) -> None:
+    _calc(tmp_path / "relax", echo={"EDIFFG": "-0.02"})
+    assert structure_precision(tmp_path / "relax") == pytest.approx(0.02)
+    _calc(tmp_path / "static", nsw=0, echo={"EDIFF": "1E-06"})
+    assert structure_precision(tmp_path / "static") == pytest.approx(1e-6)
+    _calc(tmp_path / "zero", echo={"EDIFFG": "0", "EDIFF": "1E-05"})
+    assert structure_precision(tmp_path / "zero") == pytest.approx(1e-5)
+    (tmp_path / "none").mkdir()
+    assert structure_precision(tmp_path / "none") == 0.001
+
+
+def test_collecting_emits_no_precision_warning(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    _calc(tmp_path / "a")
+    with caplog.at_level(logging.WARNING):
+        (item,) = collect_tree(tmp_path)
+    assert item.missing_collector is None
+    assert "precision" not in caplog.text

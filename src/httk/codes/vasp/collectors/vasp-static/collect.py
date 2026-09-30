@@ -5,7 +5,7 @@ It reads POSCAR and OUTCAR from the directory, each possibly compressed.
 
 from httk.workflow.collecting import JobRecord
 
-from httk.codes.vasp.collect import read_structure, read_total_energy
+from httk.codes.vasp.collect import read_structure, read_total_energy, structure_precision
 
 
 def collect(record: JobRecord) -> dict[str, object]:
@@ -14,7 +14,8 @@ def collect(record: JobRecord) -> dict[str, object]:
     :param record: The collected job record.
     :return: Extracted roles for the static run.
     """
+    precision = structure_precision(record.result_file("OUTCAR").parent)
     return {
-        "initial_structure": read_structure(record.result_file("POSCAR")),
+        "initial_structure": read_structure(record.result_file("POSCAR"), precision=precision),
         "total_energy": read_total_energy(record.result_file("OUTCAR")),
     }
