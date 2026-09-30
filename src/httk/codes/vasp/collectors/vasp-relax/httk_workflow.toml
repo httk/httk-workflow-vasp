@@ -1,0 +1,29 @@
+[workflow]
+name = "vasp.calculation.relax"
+description = "a finished VASP relaxation found in a directory"
+
+[workflow.recognize]
+file = "recognize.py"
+priority = 10
+requires = ["OUTCAR", "POSCAR"]
+
+[workflow.inputs.structure]
+role = "initial_structure"
+entry_type = "structures"
+
+[workflow.outputs.relaxed_structure]
+entry_type = "structures"
+role = "relaxed_structure"
+ref = "https://schemas.optimade.org/defs/v1.3/entrytypes/optimade/structures"
+description = "The relaxed geometry."
+product_of = "initial_structure"
+
+[workflow.outputs.total_energy]
+entry_type = "records"
+role = "total_energy"
+ref = "https://schemas.httk.org/defs/v0.1/properties/core/total_energy"
+description = "The final total energy."
+product_of = "relaxed_structure"
+
+[workflow.collect]
+file = "collect.py"

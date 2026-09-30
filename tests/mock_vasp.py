@@ -26,6 +26,7 @@ _OUTCAR = (
     " fake vasp 6.4.1\n"
     "   NELM   =     60;   NELMIN=  2; NELMDL= -5\n"
     "   NSW    =     99    number of steps for IOM\n"
+    "   IBRION =      2    ionic relax: 0-MD;1-quasi-New;2-CG\n"
     "   maximum number of plane-waves:    1234\n"
     "   FREE ENERGIE OF THE ION-ELECTRON SYSTEM (eV)\n"
     "   free  energy   TOTEN  =        -9.20000000 eV\n"

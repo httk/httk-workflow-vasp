@@ -76,7 +76,7 @@ include = ["httk.codes*", "httk.registry.codes*"]
 namespaces = true
 
 [tool.setuptools.package-data]
-"httk.codes.vasp" = ["py.typed", "*.sh"]
+"httk.codes.vasp" = ["py.typed", "*.sh", "collectors/*/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -115,6 +115,7 @@ reportMissingImports = true
 [tool.mypy]
 python_version = "3.12"
 files = ["src", "tests"]
+exclude = ["/collectors/"]  # hook files share basenames, so they cannot be distinct modules
 mypy_path = ["src", "tests"]
 namespace_packages = true
 explicit_package_bases = true

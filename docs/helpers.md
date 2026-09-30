@@ -177,3 +177,15 @@ def collect(record):
         "total_energy": read_total_energy(record.result_file("OUTCAR", data_prefix=prefix, published="static/OUTCAR")),
     }
 ```
+
+### Recognized calculations
+
+Two collectors, `vasp.calculation.relax` and `vasp.calculation.static`, let
+`httk.workflow.collect_tree(root)` collect finished free-standing VASP runs: a
+directory holding an OUTCAR and a POSCAR is classified by
+{py:func}`~httk.codes.vasp.collect.classify_vasp_calculation` from the echoed
+`NSW` and `IBRION`. A relaxation (`NSW > 0`, `IBRION` 1-3) yields the initial
+and relaxed structures and the total energy; a static run (`NSW = 0` or
+`IBRION = -1`) yields the initial structure and the energy. Molecular dynamics
+and other `IBRION` values are reported as unclaimed. The identity is a digest
+of INCAR, POSCAR, KPOINTS and POTCAR, so moving a directory keeps it.

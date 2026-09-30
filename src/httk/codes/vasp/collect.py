@@ -16,8 +16,9 @@ from pathlib import Path
 from typing import Any
 
 from httk.core import DataRecord
+from httk.workflow.hookapi import Unclaimed
 
-__all__ = ["read_structure", "read_total_energy"]
+__all__ = ["classify_vasp_calculation", "read_structure", "read_total_energy"]
 
 _TOTAL_ENERGY_DEFINITION = "https://schemas.httk.org/defs/v0.1/properties/core/total_energy"
 _TOTAL_ENERGY_NAME = "_httk_total_energy"
@@ -67,3 +68,35 @@ def read_total_energy(path: Path) -> DataRecord:
         return DataRecord.from_value(_TOTAL_ENERGY_DEFINITION, _TOTAL_ENERGY_NAME, float(lexeme))
     except (AttributeError, KeyError, OverflowError, TypeError, ValueError) as exc:
         raise ValueError(f"cannot construct a total energy from {path}; energy_sigma0={lexeme!r}: {exc}") from exc
+
+
+def classify_vasp_calculation(directory: Path) -> str | Unclaimed:
+    """Classify a VASP calculation directory from the parameters its OUTCAR echoes.
+
+    :param directory: The directory holding the OUTCAR, possibly compressed.
+    :return: ``"relax"`` (``NSW > 0`` with ``IBRION`` 1, 2 or 3), ``"static"``
+        (``NSW == 0`` or ``IBRION == -1``), or an ``Unclaimed`` saying why the
+        directory cannot be collected yet (molecular dynamics, another IBRION,
+        or an OUTCAR without a parameter echo).
+    """
+
+    from httk.atomistic.integrations.vasp.io import OutcarFile
+    from httk.workflow.collecting import existing_file
+
+    path = existing_file(Path(directory) / "OUTCAR")
+    if path is None:
+        return Unclaimed("no OUTCAR")
+    with OutcarFile(path) as outcar:
+        parameters = outcar.parameters
+    try:
+        nsw = int(parameters["NSW"])
+        ibrion = int(parameters["IBRION"])
+    except (KeyError, ValueError):
+        return Unclaimed("OUTCAR has no parameter echo")
+    if ibrion == 0:
+        return Unclaimed("molecular dynamics (IBRION = 0) is not collected yet")
+    if nsw == 0 or ibrion == -1:
+        return "static"
+    if ibrion in {1, 2, 3}:
+        return "relax"
+    return Unclaimed(f"IBRION = {ibrion} is not collected yet")
