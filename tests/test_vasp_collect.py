@@ -163,3 +163,18 @@ def test_the_mock_vasp_outcar_reports_its_last_ionic_energy(tmp_path: Path) -> N
     energy = collect_vasp_static(_record(tmp_path, "httk.vasp.static"))["total_energy"]
     assert isinstance(energy, httk.core.DataRecord)
     assert energy.value == pytest.approx(-10.5)
+
+
+def test_mock_vasp_outcar_reads_as_completed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The mock writes VASP's completion footer, so the OUTCAR reader reports a finished run."""
+    from httk.atomistic.integrations.vasp.io import OutcarFile
+
+    mock = runpy.run_path(str(Path(__file__).with_name("mock_vasp.py")))
+    poscar_path = tmp_path / "POSCAR"
+    poscar_path.write_text(_POSCAR, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    mock_main = mock["main"]
+    assert mock_main() == 0
+    outcar = OutcarFile(tmp_path / "OUTCAR")
+    assert outcar.completed
+    assert outcar.final_energies.energy_sigma0 == "-10.50000000"
