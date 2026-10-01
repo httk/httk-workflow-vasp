@@ -1,5 +1,6 @@
 """The collect-hook helpers read a structure and a total energy from VASP files."""
 
+import bz2
 import runpy
 from pathlib import Path
 
@@ -55,6 +56,15 @@ def test_an_outcar_without_final_energy_is_refused(tmp_path: Path) -> None:
     (tmp_path / "OUTCAR").write_text(" vasp.5.2.12 synthetic\n", encoding="utf-8")
     with pytest.raises(ValueError, match="cannot construct a total energy"):
         read_total_energy(tmp_path / "OUTCAR")
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_an_outcar_with_energy_but_no_completion_footer_is_refused(tmp_path: Path, compressed: bool) -> None:
+    data = _OUTCAR.split("General timing and accounting informations")[0]
+    path = tmp_path / ("OUTCAR.bz2" if compressed else "OUTCAR")
+    path.write_bytes(bz2.compress(data.encode()) if compressed else data.encode())
+    with pytest.raises(ValueError, match="incomplete.*completion footer"):
+        read_total_energy(path)
 
 
 def test_the_mock_vasp_outcar_reports_its_last_ionic_energy(tmp_path: Path) -> None:

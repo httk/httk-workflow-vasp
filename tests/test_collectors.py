@@ -77,13 +77,45 @@ def test_molecular_dynamics_is_unclaimed(tmp_path: Path) -> None:
     assert list(collect_tree(tmp_path)) == []
 
 
-def test_an_unfinished_relaxation_degrades(tmp_path: Path) -> None:
+@pytest.mark.parametrize(("nsw", "contcar"), [(99, True), (0, False)])
+@pytest.mark.parametrize("compressed", [False, True])
+def test_an_outcar_without_its_completion_footer_degrades(
+    tmp_path: Path, nsw: int, contcar: bool, compressed: bool
+) -> None:
+    calc = _calc(tmp_path / "a", nsw=nsw, contcar=contcar)
+    path = calc / "OUTCAR"
+    data = path.read_text(encoding="utf-8").split("General timing and accounting informations")[0]
+    if compressed:
+        path.unlink()
+        (calc / "OUTCAR.gz").write_bytes(gzip.compress(data.encode()))
+    else:
+        path.write_text(data, encoding="utf-8")
+    (outcome,) = claims(tmp_path)
+    assert outcome.kind == "claimed"
+    (item,) = collect_tree(tmp_path)
+    assert item.missing_collector is not None
+    assert "incomplete" in item.missing_collector
+    assert item.outputs == {}
+
+
+def test_an_unfinished_relaxation_without_an_energy_degrades(tmp_path: Path) -> None:
     calc = _calc(tmp_path / "a", contcar=False)
     (calc / "OUTCAR").write_text(_OUTCAR.split("   FREE ENERGIE")[0], encoding="utf-8")
     (outcome,) = claims(tmp_path)
     assert outcome.kind == "claimed"
     (item,) = collect_tree(tmp_path)
     assert item.missing_collector is not None
+    assert item.outputs == {}
+
+
+def test_an_incomplete_outcar_fails_fast(tmp_path: Path) -> None:
+    calc = _calc(tmp_path / "a")
+    path = calc / "OUTCAR"
+    path.write_text(
+        path.read_text(encoding="utf-8").split("General timing and accounting informations")[0], encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="incomplete"):
+        list(collect_tree(tmp_path, fail_fast=True))
 
 
 def test_compressed_files_are_collected(tmp_path: Path) -> None:

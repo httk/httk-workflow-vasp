@@ -62,12 +62,15 @@ def read_total_energy(path: Path) -> DataRecord:
 
     :param path: The OUTCAR.
     :return: The energy, in eV, as a ``total_energy`` property record.
-    :raises ValueError: If the OUTCAR has no final energy.
+    :raises ValueError: If the OUTCAR is incomplete or has no final energy.
     """
 
     lexeme: Any = None
     try:
-        final_energies = getattr(_load(path, raw=True)["outcar"], "final_energies", None)
+        outcar = _load(path, raw=True)["outcar"]
+        if not outcar.completed:
+            raise ValueError(f"{path} is incomplete: VASP completion footer is missing")
+        final_energies = getattr(outcar, "final_energies", None)
         lexeme = None if final_energies is None else getattr(final_energies, "energy_sigma0", None)
         return DataRecord.from_value(_TOTAL_ENERGY_DEFINITION, _TOTAL_ENERGY_NAME, float(lexeme))
     except (AttributeError, KeyError, OverflowError, TypeError, ValueError) as exc:
