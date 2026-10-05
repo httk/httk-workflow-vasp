@@ -128,6 +128,7 @@ def add_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]"
     vasp_run = commands.add_parser("vasp-run")
     vasp_run.add_argument("--directory", default=".")
     vasp_run.add_argument("--timeout", type=float)
+    vasp_run.add_argument("--launch", action=argparse.BooleanOptionalAction, default=None)
     vasp_run.add_argument("--grace", type=float, default=10.0)
     vasp_run.add_argument("--report", default="vasp-run-report.json")
     vasp_run.add_argument("argv", nargs=argparse.REMAINDER)
@@ -260,10 +261,13 @@ def run_command(arguments: argparse.Namespace) -> int:
         )
     elif command == "vasp-run":
         argv = arguments.argv[1:] if arguments.argv[:1] == ["--"] else arguments.argv
+        if not argv:
+            raise ValueError("vasp-run needs the VASP command after --")
         report = run_vasp(
             argv,
             directory=arguments.directory,
             timeout=arguments.timeout,
+            launch=arguments.launch,
             termination_grace=arguments.grace,
             report_path=arguments.report,
         )

@@ -57,9 +57,18 @@ The package covers:
   structured diagnostics without changing inputs;
   {py:func}`~httk.codes.vasp.validate_vasp_workdir` checks VASP's conservative
   240-byte workdir-path limit.
+
 - **Extraction and cleanup** — the final energy, volume, POTIM and plane-wave
   count, and {py:func}`~httk.codes.vasp.clean_vasp_outputs` for explicit pre-run
   cleanup.
+
+`run_vasp` takes a command that names only the program, `["vasp_std"]` (the
+`httk_vasp_run -- vasp_std` of Bash). The attempt's launch prefix, the parallel
+start the workflow manager sets in `HTTK_WORKFLOW_LAUNCH` from the
+`manager.launch_template` setting (or the built-in Slurm prefix), is prepended
+to it; `launch=False` (`--no-launch`) runs the command as given. A command that
+already starts with a launcher such as `mpirun` or `srun` is refused when a
+prefix applies. A leftover launcher (for example `vasp.command = "srun -n 32 vasp_std"`) is refused by `run_vasp` with a `ValueError` when a prefix applies; the Python VASP workflows catch only `OSError`, so the attempt ends as a runner error whose message explains the fix, and the Bash runner reports "could not run VASP at all (status 2)" with the explanation on stderr.
 
 A few behaviors make a run reproducible and a retry meaningful ({doc}`details`
 states them in full):

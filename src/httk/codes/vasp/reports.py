@@ -19,6 +19,7 @@ from httk.workflow.codes import (
     ProcessReport,
     ProcessSupervisor,
     SourceEvent,
+    launch_command,
     write_json_atomic,
 )
 
@@ -99,6 +100,7 @@ def run_vasp(
     *,
     directory: str | os.PathLike[str] = ".",
     timeout: float | None = None,
+    launch: bool | None = None,
     termination_grace: float = 10.0,
     report_path: str | os.PathLike[str] = "vasp-run-report.json",
 ) -> VaspRunReport:
@@ -108,9 +110,13 @@ def run_vasp(
     stale file from an earlier run cannot replay its diagnostics into this one;
     VASP rewrites both anyway. ``CONTCAR`` and the run report are not touched.
 
-    :param argv: Execute this VASP command argument vector.
+    :param argv: Execute this VASP command argument vector, naming the program (for example ``["vasp_std"]``).
+        The attempt's launch prefix (``HTTK_WORKFLOW_LAUNCH``) is prepended by default; a command that already
+        starts with a launcher such as ``srun`` or ``mpirun`` is refused with :class:`ValueError` when a prefix applies.
     :param directory: Run VASP in this directory.
     :param timeout: Stop the process after this duration when set.
+    :param launch: Prepend the attempt's launch prefix when true, the default (``None``);
+        ``False`` runs *argv* as given.
     :param termination_grace: Allow this duration for graceful termination.
     :param report_path: Write the structured report at this workdir-relative path.
     :return: The classified VASP run report.
@@ -125,7 +131,7 @@ def run_vasp(
         source.path.unlink(missing_ok=True)
     supervisor = ProcessSupervisor(monitors=(_VaspMonitor(),), follow=follow)
     process = supervisor.run(
-        argv,
+        launch_command(argv, launch=launch is not False),
         timeout=timeout,
         cwd=root,
         termination_grace=termination_grace,
