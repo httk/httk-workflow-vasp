@@ -13,7 +13,8 @@ import sys
 from pathlib import Path
 
 from httk.workflow import TaskManager, Workspace
-from httk.workflow.protocol import JobSpec, prepare_job_payload
+from httk.workflow.collecting import job_records
+from httk.workflow.scaffold import new_job
 
 _VASP_RUNNER = """#!/usr/bin/env bash
 set -euo pipefail
@@ -34,22 +35,20 @@ httk_workflow_main
 
 def test_a_managed_bash_runner_sources_the_vasp_api_and_calls_a_vasp_verb(tmp_path: Path) -> None:
     workspace = Workspace.initialize(tmp_path / "workspace")
-    payload = tmp_path / "payload"
-    runner = payload / "files" / "runner"
-    runner.parent.mkdir(parents=True)
-    runner.write_text(_VASP_RUNNER, encoding="utf-8")
-    runner.chmod(0o755)
-    job = prepare_job_payload(
-        payload,
-        JobSpec(name="VASP bash runner", workflow="tests.bash.vasp", runner_path="files/runner", initial_step="start"),
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "httk_workflow.toml").write_text(
+        '[workflow]\nname = "tests.bash.vasp"\n\n[workflow.runner]\nsteps = ["start"]\n', encoding="utf-8"
     )
-    workspace.submit(payload, "bash/jobs")
+    (package / "run").write_text(_VASP_RUNNER, encoding="utf-8")
+    (package / "run").chmod(0o755)
+    job = new_job(workspace, package, placement="bash/jobs", install=True)
     with TaskManager(workspace, heartbeat_interval=0.01) as manager:
         manager.run_until_idle(timeout=120.0)
 
-    marker = workspace.find_marker_by_id(job.id)
-    assert marker is not None and marker.kind == "succeeded"
-    root = workspace.payload_path(marker.placement, marker.job_key)
+    [record] = job_records(workspace, states=("succeeded", "failed"))
+    assert (record.job_id, record.state) == (job.job_id, "succeeded"), record.failure
+    root = record.workspace_root / record.payload_path
     assert json.loads((root / ".httk-job" / "state.json").read_text(encoding="utf-8")) == {"encut": 520}
 
 
