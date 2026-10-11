@@ -38,6 +38,7 @@ from . import (
     prepare_vasp_inputs,
     rattle_poscar,
     read_incar,
+    reapply_vasp_remedies,
     run_vasp,
     scale_poscar_lattice,
     update_incar,
@@ -145,6 +146,11 @@ def add_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]"
     remedy_apply.add_argument("decision")
     remedy_apply.add_argument("--directory", default=".")
     remedy_apply.add_argument("--history", default=_remedy_history_default())
+    report_problems = commands.add_parser("vasp-report-problems")
+    report_problems.add_argument("report")
+    remedy_reapply = commands.add_parser("vasp-remedy-reapply")
+    remedy_reapply.add_argument("--directory", default=".")
+    remedy_reapply.add_argument("--history", default=_remedy_history_default())
 
 
 def _diagnostics_from_report(path: Path):
@@ -310,6 +316,16 @@ def run_command(arguments: argparse.Namespace) -> int:
             # an attempt so the utility still runs by hand outside one.
             durable=os.environ.get("HTTK_WORKFLOW_DURABLE") == "1",
         )
+    elif command == "vasp-report-problems":
+        # dict.fromkeys: distinct codes in report order.
+        codes = dict.fromkeys(
+            item.code for item in _diagnostics_from_report(Path(arguments.report)) if item.severity != "warning"
+        )
+        for code in codes:
+            print(code)
+    elif command == "vasp-remedy-reapply":
+        changes = reapply_vasp_remedies(directory=arguments.directory, history_path=arguments.history)
+        print(json.dumps([{"operation": name, "value": value} for name, value in changes], separators=(",", ":")))
     else:
         raise AssertionError(command)
     return 0

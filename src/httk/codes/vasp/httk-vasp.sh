@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Native httk VASP Bash API, version 2. Source httk-workflow.sh first.
+# Native httk VASP Bash API, version 3. Source httk-workflow.sh first.
 #
 # Every function is one bridge subcommand, and every option of that subcommand is
 # available here: the arguments are passed through untouched. Version 2 keeps that
@@ -17,7 +17,12 @@
 # the job state directory by default, so a job with an isolated workdir keeps
 # climbing it; httk_vasp_remedy_plan prints the diagnosed problem on stdout and
 # takes --directory (the calculation it validates the remedy against) and --policy.
-HTTK_VASP_BASH_API_VERSION=2
+# httk_vasp_remedy_reapply re-applies the INCAR/KPOINTS edits of every remedy in
+# that history onto freshly prepared inputs (a new stage), printing them as JSON.
+#
+# Version 3 adds httk_vasp_remedy_reapply and httk_vasp_report_problems (the
+# distinct non-warning diagnostic codes of a run report, one per line).
+HTTK_VASP_BASH_API_VERSION=3
 
 _httk_vasp_require_workflow_api() {
     if ! declare -F _httk_workflow_bridge >/dev/null 2>&1; then
@@ -121,6 +126,11 @@ httk_vasp_diagnose() {
     _httk_workflow_bridge vasp-diagnose "$@"
 }
 
+httk_vasp_report_problems() {
+    _httk_vasp_require_workflow_api || return
+    _httk_workflow_bridge vasp-report-problems "$@"
+}
+
 httk_vasp_remedy_plan() {
     _httk_vasp_require_workflow_api || return
     _httk_workflow_bridge vasp-remedy-plan "$@"
@@ -129,4 +139,9 @@ httk_vasp_remedy_plan() {
 httk_vasp_remedy_apply() {
     _httk_vasp_require_workflow_api || return
     _httk_workflow_bridge vasp-remedy-apply "$@"
+}
+
+httk_vasp_remedy_reapply() {
+    _httk_vasp_require_workflow_api || return
+    _httk_workflow_bridge vasp-remedy-reapply "$@"
 }

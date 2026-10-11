@@ -108,8 +108,11 @@ step_prepare() {
 ```
 
 The `httk_vasp_*` functions correspond directly to the Python helpers: `prepare`,
-`prepare_kpoints`, `prepare_potcar`, `get_tag`, `set_tag` and `nbands`; `run` and `diagnose`;
-`remedy_plan` and `remedy_apply`; `preclean`, `clean_outcar`, `normalize_poscar`,
+`prepare_kpoints`, `prepare_potcar`, `get_tag`, `set_tag` and `nbands`; `run`,
+`diagnose` and `report_problems` (which prints the distinct non-warning diagnostic
+codes of a run report, one per line); `remedy_plan`, `remedy_apply` and
+`remedy_reapply` (which prints the replayed changes as JSON); `preclean`,
+`clean_outcar`, `normalize_poscar`,
 `scale_poscar`, `rattle_poscar`, `promote_contcar`, and the energy, volume, POTIM,
 plane-wave and POTCAR-summary extractors. Each is one `vasp-*` bridge command, and
 every option of that command is available because arguments pass through
@@ -142,6 +145,12 @@ to refuse. Applying a decision uses a replayable workdir batch and records the
 before and after input digests. The escalation history belongs beside the job
 state ({py:func}`~httk.codes.vasp.job_remedy_history_path`), so a job with an
 isolated workdir keeps climbing the ladder instead of silently restarting it.
+
+A staged workflow that re-prepares INCAR and KPOINTS from a new template at each
+stage calls {py:func}`~httk.codes.vasp.reapply_vasp_remedies` right after
+{py:func}`~httk.codes.vasp.prepare_vasp_inputs`: it replays the INCAR and k-point
+edits of every recorded remedy onto the fresh inputs, as *httk* v1's remedies did,
+skips the one-time structure edits, and leaves the history untouched.
 
 Policies are a registry: {py:func}`~httk.codes.vasp.register_remedy_policy` adds
 one, {py:func}`~httk.codes.vasp.remedy_policy_names` lists them, and an unknown

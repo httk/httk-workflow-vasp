@@ -511,15 +511,7 @@ def apply_vasp_remedy(
                 tags = read_incar(staging / "INCAR")
                 if "NBANDS" not in tags:
                     raise ValueError("cannot bump absent NBANDS")
-                bands = int(tags["NBANDS"]) + int(str(value))
-                if "NPAR" in tags:
-                    divisor = int(tags["NPAR"])
-                    if divisor < 1:
-                        raise ValueError("NPAR must be positive")
-                    remainder = bands % divisor
-                    if remainder:
-                        bands += divisor - remainder
-                incar_updates["NBANDS"] = bands
+                incar_updates["NBANDS"] = _bumped_bands(tags, value)
             elif operation in {"bump_kpoints", "equal_kpoints", "centering"}:
                 _modify_kpoints(staging / "KPOINTS", operation, value)
                 changed["KPOINTS"] = staging / "KPOINTS"
@@ -568,6 +560,80 @@ def apply_vasp_remedy(
         return batch.commit()
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+
+
+def reapply_vasp_remedies(
+    *, directory: str | os.PathLike[str] = ".", history_path: str | os.PathLike[str] = DEFAULT_REMEDY_HISTORY
+) -> tuple[RemedyChange, ...]:
+    """Re-apply the input edits of every remedy already applied to a job.
+
+    httk v1 remedies were sticky across the stages of a staged workflow:
+    ``VASP_PREPARE_INCAR`` re-read every ``ht.remedy.*`` file on each
+    preparation, so ``ISYM = 0`` found necessary in one stage stayed on in the
+    next. A stage that re-prepares its inputs from its own template loses the
+    edits :func:`apply_vasp_remedy` made in place; calling this right after
+    :func:`~httk.codes.vasp.prepare_vasp_inputs` restores them, in history order.
+
+    ``incar.<TAG>`` assignments, ``scale_ediff``, ``bump_bands`` and the k-point
+    operations are replayed onto the fresh INCAR and KPOINTS. ``scale_ediff`` is
+    skipped when the fresh INCAR sets no ``EDIFF``, ``bump_bands`` when it sets no
+    ``NBANDS``, and the k-point operations when the stage has no KPOINTS file (a
+    ``KSPACING`` stage). The structure operations ``scale_lattice`` and
+    ``contcar_to_poscar`` are skipped: they were one-time edits of a structure the
+    stage carries forward anyway. The history is only read, never written, so the
+    escalation ladder does not advance. Each file is rewritten atomically, without
+    a replayable batch: running this on freshly prepared inputs is idempotent by
+    construction.
+
+    :param directory: Edit the INCAR and KPOINTS in this VASP directory.
+    :param history_path: Read the remedy history from this path; a missing file
+        means no edits.
+    :return: The changes applied, in order.
+    :raises ValueError: If the history names an unsupported remedy operation.
+    """
+
+    root = Path(directory).resolve()
+    incar = root / "INCAR"
+    applied: list[RemedyChange] = []
+    for event in _read_remedy_history(root, history_path).get("events", []):
+        for item in event.get("changes", []):
+            operation, value = str(item["operation"]), item.get("value")
+            if operation.startswith("incar."):
+                update_incar({operation.removeprefix("incar."): value}, incar)
+            elif operation == "scale_ediff":
+                tags = read_incar(incar)
+                if "EDIFF" not in tags:
+                    continue
+                update_incar({"EDIFF": float(tags["EDIFF"]) * float(str(value))}, incar)
+            elif operation == "bump_bands":
+                tags = read_incar(incar)
+                if "NBANDS" not in tags:
+                    continue
+                update_incar({"NBANDS": _bumped_bands(tags, value)}, incar)
+            elif operation in {"bump_kpoints", "equal_kpoints", "centering"}:
+                if not (root / "KPOINTS").is_file():
+                    continue
+                _modify_kpoints(root / "KPOINTS", operation, value)
+            elif operation in {"scale_lattice", "contcar_to_poscar"}:
+                continue
+            else:
+                raise ValueError(f"unsupported remedy operation: {operation}")
+            applied.append((operation, value))
+    return tuple(applied)
+
+
+def _bumped_bands(tags: Mapping[str, str], value: object) -> int:
+    """Return ``NBANDS`` raised by *value* and rounded up to a multiple of ``NPAR``."""
+
+    bands = int(tags["NBANDS"]) + int(str(value))
+    if "NPAR" in tags:
+        divisor = int(tags["NPAR"])
+        if divisor < 1:
+            raise ValueError("NPAR must be positive")
+        remainder = bands % divisor
+        if remainder:
+            bands += divisor - remainder
+    return bands
 
 
 def _modify_kpoints(path: Path, operation: str, value: object) -> None:

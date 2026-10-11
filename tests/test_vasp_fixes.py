@@ -29,6 +29,7 @@ from httk.codes.vasp import (
     prepare_vasp_inputs,
     rattle_poscar,
     read_incar,
+    reapply_vasp_remedies,
     register_remedy_policy,
     remedy_policy,
     remedy_policy_names,
@@ -430,3 +431,56 @@ def test_an_unexecutable_policy_is_refused_at_registration() -> None:
     with pytest.raises(ValueError, match="already registered"):
         register_remedy_policy("reviewed-v1", {}, ())
     assert "tests-bad-operation" not in remedy_policy_names()
+
+
+def test_reapplied_remedies_survive_a_fresh_stage_without_advancing_the_ladder(tmp_path: Path) -> None:
+    # A staged workflow re-prepares INCAR and KPOINTS from each stage's template;
+    # the input edits of earlier remedies must carry over, as v1's did.
+    _poscar(tmp_path)
+    _kpoints(tmp_path)
+    fresh_incar = "ENCUT = 520\nISYM = 2\n"
+    (tmp_path / "INCAR").write_text(fresh_incar, encoding="utf-8")
+    history = job_remedy_history_path(tmp_path)
+    for code in ("inverse_rotation", "ions_too_close"):
+        decision = plan_vasp_remedy(
+            (Diagnostic(code, "error", code, "stdout"),), directory=tmp_path, history_path=history
+        )
+        apply_vasp_remedy(decision, directory=tmp_path, history_path=history)
+    kpoints_step = VaspRemedyDecision(
+        "reviewed-v1", "kpoints_class", 2, (("bump_kpoints", 1), ("centering", "Gamma")), False, "manual"
+    )
+    apply_vasp_remedy(kpoints_step, directory=tmp_path, history_path=history)
+
+    (tmp_path / "INCAR").write_text(fresh_incar, encoding="utf-8")
+    _kpoints(tmp_path)
+    poscar = (tmp_path / "POSCAR").read_text(encoding="utf-8")
+    recorded = history.read_text(encoding="utf-8")
+
+    applied = reapply_vasp_remedies(directory=tmp_path, history_path=history)
+
+    assert applied == (("incar.ISYM", 0), ("bump_kpoints", 1), ("centering", "Gamma"))
+    assert read_incar(tmp_path / "INCAR") == {"ENCUT": "520", "ISYM": "0"}
+    assert (tmp_path / "KPOINTS").read_text(encoding="utf-8").splitlines()[2:4] == ["Gamma", "4 4 4"]
+    # The scale_lattice event is not replayed, and the history is untouched.
+    assert (tmp_path / "POSCAR").read_text(encoding="utf-8") == poscar
+    assert history.read_text(encoding="utf-8") == recorded
+
+
+def test_reapplying_remedies_without_a_history_is_a_no_op_and_unknown_operations_are_refused(tmp_path: Path) -> None:
+    assert reapply_vasp_remedies(directory=tmp_path) == ()
+    history = tmp_path / "history.json"
+    history.write_text(json.dumps({"events": [{"changes": [{"operation": "bogus", "value": 1}]}]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="unsupported remedy operation: bogus"):
+        reapply_vasp_remedies(directory=tmp_path, history_path=history)
+
+
+def test_reapplied_kpoint_remedies_are_skipped_for_a_stage_without_kpoints(tmp_path: Path) -> None:
+    # A KSPACING stage writes no KPOINTS; its INCAR edits still carry over.
+    (tmp_path / "INCAR").write_text("KSPACING = 0.2\n", encoding="utf-8")
+    history = tmp_path / "history.json"
+    changes = [{"operation": "centering", "value": "Gamma"}, {"operation": "incar.ISYM", "value": 0}]
+    history.write_text(json.dumps({"events": [{"changes": changes}]}), encoding="utf-8")
+
+    assert reapply_vasp_remedies(directory=tmp_path, history_path=history) == (("incar.ISYM", 0),)
+    assert not (tmp_path / "KPOINTS").exists()
+    assert read_incar(tmp_path / "INCAR") == {"KSPACING": "0.2", "ISYM": "0"}

@@ -82,3 +82,32 @@ def test_code_bridge_commands_keep_the_absent_and_refused_exit_codes(tmp_path: P
     batch_refused = _bridge(tmp_path, "batch", stdin="vasp-rattle-poscar\n")
     assert batch_refused.returncode == 2
     assert batch_refused.stderr.startswith(refusal) and "batch line 1 failed" in batch_refused.stderr
+
+
+def test_the_reapply_bridge_command_prints_the_replayed_changes(tmp_path: Path) -> None:
+    (tmp_path / "INCAR").write_text("ISYM = 2\n", encoding="utf-8")
+    history = tmp_path / "history.json"
+    history.write_text(
+        json.dumps({"events": [{"changes": [{"operation": "incar.ISYM", "value": 0}]}]}), encoding="utf-8"
+    )
+
+    result = _bridge(tmp_path, "vasp-remedy-reapply", "--history", str(history))
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [{"operation": "incar.ISYM", "value": 0}]
+    assert (tmp_path / "INCAR").read_text(encoding="utf-8") == "ISYM = 0\n"
+
+
+def test_the_report_problems_bridge_command_lists_distinct_non_warning_codes(tmp_path: Path) -> None:
+    diagnostics = [
+        {"code": "ionic_nonconvergence", "severity": "error"},
+        {"code": "lreal_false", "severity": "warning"},
+        {"code": "zpotrf", "severity": "fatal"},
+        {"code": "ionic_nonconvergence", "severity": "error"},
+    ]
+    (tmp_path / "vasp-run-report.json").write_text(json.dumps({"diagnostics": diagnostics}), encoding="utf-8")
+
+    result = _bridge(tmp_path, "vasp-report-problems", "vasp-run-report.json")
+
+    assert (result.returncode, result.stdout) == (0, "ionic_nonconvergence\nzpotrf\n"), result.stderr
+    assert _bridge(tmp_path, "vasp-report-problems", "missing.json").returncode == 2
