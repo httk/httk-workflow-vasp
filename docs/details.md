@@ -54,12 +54,16 @@ cleanup while preserving requested files. Diagnosis never changes inputs.
 Remedies are bounded, planned, and applied explicitly.
 {py:func}`~httk.codes.vasp.plan_vasp_remedy` validates every rung of the ladder
 against the calculation directory it is given and skips one it cannot execute — a
-`bump_bands` for an INCAR without `NBANDS`, a KPOINTS change with no KPOINTS staged
-— so {py:func}`~httk.codes.vasp.apply_vasp_remedy` never receives a remedy it would
+`bump_bands` for an INCAR without `NBANDS`, a KPOINTS change with no KPOINTS staged, or
+with a KPOINTS that is not a Gamma or Monkhorst-Pack automatic mesh (line-mode and
+explicit-list files are protected) — so
+{py:func}`~httk.codes.vasp.apply_vasp_remedy` never receives a remedy it would
 have to refuse. Both resolve a relative history path against that same directory;
 {py:func}`~httk.codes.vasp.job_remedy_history_path` of the job payload is where a
 runner should keep it, beside the job state, so an isolated workdir does not
-silently restart the escalation.
+silently restart the escalation. A staged runner forbids ladder steps that are
+wrong for one stage (geometry changes, or `incar.ICHARG` in a non-self-consistent
+stage) with `excluded_operations=`, which skips them like inapplicable steps.
 
 Policies are a registry rather than module source:
 {py:func}`~httk.codes.vasp.register_remedy_policy` adds one,

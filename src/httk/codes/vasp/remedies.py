@@ -13,7 +13,7 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -339,6 +339,24 @@ def _read_remedy_history(root: Path, history_path: str | os.PathLike[str]) -> di
     return _empty_remedy_history()
 
 
+def _automatic_mesh(lines: Sequence[str]) -> bool:
+    """Return whether KPOINTS *lines* are a Gamma or Monkhorst-Pack automatic mesh.
+
+    VASP reads only the first character of line three, and the mesh form needs a
+    zero on line two; line-mode, explicit-list and fully automatic files differ.
+    """
+
+    if len(lines) < 4:
+        return False
+    count = lines[1].split()
+    return (
+        bool(count)
+        and re.fullmatch(r"[-+]?[0-9]+", count[0]) is not None
+        and int(count[0]) == 0
+        and lines[2].lstrip()[:1] in {"G", "g", "M", "m"}
+    )
+
+
 def _remedy_obstacle(root: Path, changes: Sequence[RemedyChange]) -> str | None:
     """Return why *changes* cannot be applied in *root*, or ``None`` when they can.
 
@@ -370,8 +388,8 @@ def _remedy_obstacle(root: Path, changes: Sequence[RemedyChange]) -> str | None:
             if not kpoints.is_file():
                 return f"{operation} needs a staged KPOINTS in {root}"
             lines = kpoints.read_text(encoding="utf-8", errors="replace").splitlines()
-            if len(lines) < 4:
-                return f"{operation} needs a KPOINTS with at least four lines"
+            if not _automatic_mesh(lines):
+                return f"{operation} needs a Gamma or Monkhorst-Pack automatic-mesh KPOINTS"
             if operation != "centering":
                 grid = lines[3].split()[:3]
                 if len(grid) != 3 or any(re.fullmatch(r"[-+]?[0-9]+", item) is None for item in grid):
@@ -405,6 +423,7 @@ def plan_vasp_remedy(
     directory: str | os.PathLike[str] = ".",
     history_path: str | os.PathLike[str] = DEFAULT_REMEDY_HISTORY,
     policy: str = "reviewed-v1",
+    excluded_operations: Collection[str] = (),
 ) -> VaspRemedyDecision:
     """Return, but do not apply, the next remedy of *policy*.
 
@@ -417,10 +436,19 @@ def plan_vasp_remedy(
     :param directory: Inspect and plan changes in this VASP directory.
     :param history_path: Read the remedy history from this path.
     :param policy: Select this registered remedy policy.
+    :param excluded_operations: Skip every ladder step containing one of these
+        operation names (for example ``"scale_lattice"`` or ``"incar.ICHARG"``),
+        as a staged runner does to forbid steps that are wrong for one stage.
     :return: The next applicable remedy decision.
-    :raises ValueError: If the remedy history or policy is invalid.
+    :raises ValueError: If the remedy history or policy is invalid, or
+        *excluded_operations* is a bare string or names an unknown operation.
     """
 
+    if isinstance(excluded_operations, str):
+        raise ValueError("excluded_operations must be a collection of operation names, not a string")
+    for name in excluded_operations:
+        if name not in REMEDY_OPERATIONS and re.fullmatch(r"incar\.[A-Z][A-Z0-9_]*", name) is None:
+            raise ValueError(f"unknown remedy operation in excluded_operations: {name!r}")
     resolved = remedy_policy(policy)
     root = Path(directory).resolve()
     history = _read_remedy_history(root, history_path)
@@ -436,9 +464,15 @@ def plan_vasp_remedy(
     sequence = resolved.sequences.get(problem, ())
     skipped: list[str] = []
     while step < len(sequence):
-        obstacle = _remedy_obstacle(root, sequence[step])
+        excluded = sorted({name for name, _ in sequence[step]} & set(excluded_operations))
+        obstacle = (
+            f"excluded by the caller: {', '.join(excluded)}" if excluded else _remedy_obstacle(root, sequence[step])
+        )
         if obstacle is None:
-            return VaspRemedyDecision(policy, problem, step, sequence[step], False, "reviewed remedy available")
+            reason = "reviewed remedy available"
+            if skipped:
+                reason = f"{reason} (skipped {'; '.join(skipped)})"
+            return VaspRemedyDecision(policy, problem, step, sequence[step], False, reason)
         _LOGGER.info("remedy step %d for %s is not applicable in %s: %s", step, problem, root, obstacle)
         skipped.append(f"step {step}: {obstacle}")
         step += 1
@@ -578,9 +612,11 @@ def reapply_vasp_remedies(
     operations are replayed onto the fresh INCAR and KPOINTS. ``scale_ediff`` is
     skipped when the fresh INCAR sets no ``EDIFF``, ``bump_bands`` when it sets no
     ``NBANDS``, and the k-point operations when the stage has no KPOINTS file (a
-    ``KSPACING`` stage). The structure operations ``scale_lattice`` and
-    ``contcar_to_poscar`` are skipped: they were one-time edits of a structure the
-    stage carries forward anyway. The history is only read, never written, so the
+    ``KSPACING`` stage) or its KPOINTS is not a Gamma or Monkhorst-Pack automatic
+    mesh (line-mode, explicit-list and fully automatic files are left untouched).
+    The structure operations ``scale_lattice`` and ``contcar_to_poscar`` are
+    skipped: they were one-time edits of a structure the stage carries forward
+    anyway. The history is only read, never written, so the
     escalation ladder does not advance. Each file is rewritten atomically, without
     a replayable batch: running this on freshly prepared inputs is idempotent by
     construction.
@@ -611,7 +647,8 @@ def reapply_vasp_remedies(
                     continue
                 update_incar({"NBANDS": _bumped_bands(tags, value)}, incar)
             elif operation in {"bump_kpoints", "equal_kpoints", "centering"}:
-                if not (root / "KPOINTS").is_file():
+                kpoints = root / "KPOINTS"
+                if not kpoints.is_file() or not _automatic_mesh(kpoints.read_text(encoding="utf-8").splitlines()):
                     continue
                 _modify_kpoints(root / "KPOINTS", operation, value)
             elif operation in {"scale_lattice", "contcar_to_poscar"}:

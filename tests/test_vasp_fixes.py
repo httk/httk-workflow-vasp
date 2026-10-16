@@ -484,3 +484,66 @@ def test_reapplied_kpoint_remedies_are_skipped_for_a_stage_without_kpoints(tmp_p
     assert reapply_vasp_remedies(directory=tmp_path, history_path=history) == (("incar.ISYM", 0),)
     assert not (tmp_path / "KPOINTS").exists()
     assert read_incar(tmp_path / "INCAR") == {"KSPACING": "0.2", "ISYM": "0"}
+
+
+_KZ = (Diagnostic("kpoints_class", "error", "k-points", "stdout"),)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["c\n40\nLine-mode\nReciprocal\n0 0 0 ! G\n", "c\n2\nReciprocal\n0 0 0 1\n0.5 0 0 1\n", "c\n0\nAuto\n10\n"],
+)
+def test_kpoint_remedies_skip_files_that_are_not_automatic_meshes(tmp_path: Path, text: str) -> None:
+    (tmp_path / "KPOINTS").write_text(text, encoding="utf-8")
+    (tmp_path / "INCAR").write_text("ENCUT = 400\n", encoding="utf-8")
+
+    decision = plan_vasp_remedy(_KZ, directory=tmp_path, history_path=tmp_path / "h.json")
+
+    assert decision.changes == (("incar.ISYM", 0),)
+
+
+def test_automatic_mesh_detection_accepts_lowercase_first_letters(tmp_path: Path) -> None:
+    for word in ("gamma", "monkhorst"):
+        (tmp_path / "KPOINTS").write_text(f"c\n 0 \n  {word}\n3 3 3\n", encoding="utf-8")
+        decision = plan_vasp_remedy(_KZ, directory=tmp_path, history_path=tmp_path / "h.json")
+        assert decision.changes == (("bump_kpoints", 1),)
+
+
+def test_reapplying_remedies_leaves_a_line_mode_kpoints_untouched(tmp_path: Path) -> None:
+    text = "c\n40\nLine-mode\nReciprocal\n0 0 0 ! G\n"
+    (tmp_path / "KPOINTS").write_text(text, encoding="utf-8")
+    (tmp_path / "INCAR").write_text("ENCUT = 400\n", encoding="utf-8")
+    history = tmp_path / "history.json"
+    ops = (("centering", "Gamma"), ("bump_kpoints", 1), ("incar.ISYM", 0))
+    changes = [{"operation": o, "value": v} for o, v in ops]
+    history.write_text(json.dumps({"events": [{"changes": changes}]}), encoding="utf-8")
+
+    assert reapply_vasp_remedies(directory=tmp_path, history_path=history) == (("incar.ISYM", 0),)
+    assert (tmp_path / "KPOINTS").read_text(encoding="utf-8") == text
+
+
+def test_excluded_operations_skip_ladder_steps_and_are_named_when_giving_up(tmp_path: Path) -> None:
+    _poscar(tmp_path)
+    _kpoints(tmp_path)
+    (tmp_path / "INCAR").write_text("ENCUT = 400\n", encoding="utf-8")
+    zpotrf = (Diagnostic("zpotrf", "fatal", "x", "stdout"),)
+    history = tmp_path / "h.json"
+
+    decision = plan_vasp_remedy(zpotrf, directory=tmp_path, history_path=history, excluded_operations={"scale_lattice"})
+    assert decision.changes == (("bump_kpoints", 1),)
+    assert "skipped step 0: excluded by the caller: scale_lattice" in decision.reason
+
+    scf = (Diagnostic("electronic_nonconvergence", "error", "x", "stdout"),)
+    decision = plan_vasp_remedy(scf, directory=tmp_path, history_path=history, excluded_operations={"incar.ICHARG"})
+    assert decision.changes == (("incar.ALGO", "All"), ("incar.TIME", 0.4))
+
+    everything = {"scale_lattice", "bump_kpoints", "bump_bands", "incar.ISMEAR", "incar.ISYM"}
+    decision = plan_vasp_remedy(zpotrf, directory=tmp_path, history_path=history, excluded_operations=everything)
+    assert decision.give_up
+    assert "excluded by the caller: scale_lattice" in decision.reason
+
+
+@pytest.mark.parametrize("bad", ["scale_lattice", {"Scale_Lattice"}, {"incar.icharg"}, {"bogus"}])
+def test_excluded_operations_reject_strings_and_unknown_names(tmp_path: Path, bad: object) -> None:
+    with pytest.raises(ValueError, match="excluded_operations"):
+        plan_vasp_remedy(_KZ, directory=tmp_path, excluded_operations=bad)  # type: ignore[arg-type]

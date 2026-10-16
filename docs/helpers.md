@@ -139,7 +139,9 @@ if not decision.give_up:
 ```
 
 {py:func}`~httk.codes.vasp.plan_vasp_remedy` validates every rung of the ladder
-against the calculation directory and skips one it cannot execute, so
+against the calculation directory and skips one it cannot execute (k-point
+remedies need a Gamma or Monkhorst-Pack automatic-mesh KPOINTS, so line-mode and
+explicit files are protected) or one containing an operation named in its `excluded_operations` argument, so
 {py:func}`~httk.codes.vasp.apply_vasp_remedy` never receives a remedy it would have
 to refuse. Applying a decision uses a replayable workdir batch and records the
 before and after input digests. The escalation history belongs beside the job
@@ -149,7 +151,8 @@ isolated workdir keeps climbing the ladder instead of silently restarting it.
 A staged workflow that re-prepares INCAR and KPOINTS from a new template at each
 stage calls {py:func}`~httk.codes.vasp.reapply_vasp_remedies` right after
 {py:func}`~httk.codes.vasp.prepare_vasp_inputs`: it replays the INCAR and k-point
-edits of every recorded remedy onto the fresh inputs, as *httk* v1's remedies did,
+edits of every recorded remedy onto the fresh inputs (k-point edits only onto an
+automatic mesh), as *httk* v1's remedies did,
 skips the one-time structure edits, and leaves the history untouched.
 
 Policies are a registry: {py:func}`~httk.codes.vasp.register_remedy_policy` adds
