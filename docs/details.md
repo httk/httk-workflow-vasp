@@ -132,6 +132,50 @@ without the manual rank reduction, using this library revision, and inspect
 the applied ladder, effective parallelization and converged output. That
 cluster check remains to be performed by the supervisor/operator.
 
+## Variant dispatch
+
+{py:mod}`httk.codes.vasp.launch` picks the VASP binary a calculation's inputs
+need where those inputs exist, for launchers that run one configured command
+(custodian, and so atomate2) while the INCAR is only written inside the job.
+{py:func}`~httk.codes.vasp.launch.select_vasp_command` reads `INCAR` and
+`KPOINTS` in a directory and returns:
+
+- the non-collinear command when `LNONCOLLINEAR` or `LSORBIT` is true; without
+  one it raises `ValueError` naming the missing `--ncl`/`vasp.ncl_command`
+  setting, rather than letting a standard binary fail on the INCAR;
+- the Gamma-only command, when one is configured, for a run custodian's
+  `_gamma_point_only_check` treats as Gamma-only: neither `LEPSILON` nor
+  `LOPTICS` true, and `KPOINTS` an automatic Gamma or Monkhorst-Pack mesh of
+  `1 1 1` whose shift is absent or zero. One deliberate deviation: with no
+  `KPOINTS` file (a `KSPACING` run) the standard command is chosen, since the
+  mesh is not judged from `KSPACING`. Explicit k-point lists, line mode and
+  fully automatic files also select the standard command;
+- the standard command otherwise.
+
+Its command-line form selects for the current directory and replaces itself
+with the chosen command:
+
+```text
+srun … python -m httk.codes.vasp.launch --standard vasp_std --ncl vasp_ncl --gamma vasp_gam
+```
+
+It sits behind the attempt's launch prefix, so every MPI rank reads the inputs
+and execs the right binary. Each command is one shlex-quoted string; `--ncl` and
+`--gamma` are optional, and `--directory` reads the inputs from another
+directory (the command still runs in the current one). The commands travel in
+argv, not the environment, because a confined launch drops `HTTK_`-prefixed
+variables from rank environments. When no command can be selected or executed
+it prints `httk.codes.vasp.launch: <reason>` to stderr and exits with status 2;
+a program that cannot be executed is named together with the variant
+(`--standard`, `--ncl` or `--gamma`) that selected it. Under atomate2 the job
+reports only "Job return code is 2": custodian redirects stderr, so the reason
+is in the calculation directory's `std_err.txt`, once per rank. Importing the
+module imports the package {py:mod}`httk.codes.vasp` and through it
+*httk-core* and numpy, which costs about 0.3 s per rank before the exec;
+pymatgen is never imported.
+{py:func}`~httk.codes.vasp.run_vasp` and the native runners do not use the
+dispatcher yet.
+
 ## Dependencies
 
 These functions are independent *httk₂* interfaces. They do not import the Python
