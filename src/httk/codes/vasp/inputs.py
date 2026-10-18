@@ -487,9 +487,10 @@ def scale_poscar_lattice(
     factor: float,
     path: str | os.PathLike[str] = "POSCAR",
 ) -> Path:
-    """Multiply POSCAR's universal linear scale by a positive factor.
+    """Scale POSCAR's lattice lengths by a positive linear factor, for either form of the scale line.
 
-    :param factor: Multiply the current scale by this positive finite value.
+    :param factor: Scale every lattice length by this positive finite value; a negative
+        (target volume) scale line is multiplied by its cube.
     :param path: Update the POSCAR file at this path.
     :return: The updated POSCAR path.
     :raises ValueError: If the factor or POSCAR scale line is invalid.
@@ -505,7 +506,9 @@ def scale_poscar_lattice(
         scale = float(lines[1].split()[0])
     except (IndexError, ValueError) as exc:
         raise ValueError("POSCAR has an invalid scale line") from exc
-    lines[1] = f"{scale * factor:.16g}"
+    if scale == 0:
+        raise ValueError("POSCAR has an invalid scale line")
+    lines[1] = f"{scale * (factor**3 if scale < 0 else factor):.16g}"
     _write_text_atomic(destination, "\n".join(lines) + "\n")
     return destination
 

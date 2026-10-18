@@ -34,6 +34,7 @@ from httk.codes.vasp import (
     remedy_policy,
     remedy_policy_names,
     run_vasp,
+    scale_poscar_lattice,
     update_incar,
     write_automatic_kpoints,
 )
@@ -61,6 +62,23 @@ def _kpoints(root: Path, grid: str = "3 3 3") -> Path:
     path = root / "KPOINTS"
     path.write_text(f"mesh\n0\nMonkhorst-Pack\n{grid}\n0 0 0\n", encoding="utf-8")
     return path
+
+
+@pytest.mark.parametrize(("scale", "factor", "expected"), [("1.0", 1.05, "1.05"), ("-20.0", 2.0, "-160")])
+def test_scaling_a_poscar_treats_a_negative_scale_as_a_volume(
+    tmp_path: Path, scale: str, factor: float, expected: str
+) -> None:
+    path = _poscar(tmp_path)
+    path.write_text(_POSCAR.replace("\n1.0\n", f"\n{scale}\n"), encoding="utf-8")
+    scale_poscar_lattice(factor, path)
+    assert path.read_text(encoding="utf-8").splitlines()[1] == expected
+
+
+def test_scaling_a_poscar_with_a_zero_scale_is_refused(tmp_path: Path) -> None:
+    path = _poscar(tmp_path)
+    path.write_text(_POSCAR.replace("\n1.0\n", "\n0\n"), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid scale line"):
+        scale_poscar_lattice(1.05, path)
 
 
 def test_updating_one_tag_of_a_semicolon_line_leaves_no_second_assignment(tmp_path: Path) -> None:
