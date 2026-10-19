@@ -130,6 +130,7 @@ def add_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]"
     vasp_run.add_argument("--directory", default=".")
     vasp_run.add_argument("--timeout", type=float)
     vasp_run.add_argument("--launch", action=argparse.BooleanOptionalAction, default=None)
+    vasp_run.add_argument("--dispatch", action=argparse.BooleanOptionalAction, default=True)
     vasp_run.add_argument("--grace", type=float, default=10.0)
     vasp_run.add_argument("--report", default="vasp-run-report.json")
     vasp_run.add_argument("argv", nargs=argparse.REMAINDER)
@@ -276,6 +277,7 @@ def run_command(arguments: argparse.Namespace) -> int:
             launch=arguments.launch,
             termination_grace=arguments.grace,
             report_path=arguments.report,
+            dispatch=arguments.dispatch,
         )
         return {
             "completed": 0,

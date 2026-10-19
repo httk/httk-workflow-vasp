@@ -170,7 +170,9 @@ def test_a_preclean_keeps_the_evidence_the_remedy_machinery_reads(tmp_path: Path
     ),
 )
 def test_zhegv_output_variants_are_diagnosed(tmp_path: Path, message: str) -> None:
-    report = run_vasp([sys.executable, "-c", f"print({message!r}); raise SystemExit(1)"], directory=tmp_path)
+    report = run_vasp(
+        [sys.executable, "-c", f"print({message!r}); raise SystemExit(1)"], directory=tmp_path, dispatch=False
+    )
     diagnostic = next(item for item in report.diagnostics if item.code == "edddav_zhegv")
     assert diagnostic.severity == "error"
     assert diagnostic.evidence == message
@@ -181,6 +183,7 @@ def test_other_eigensolver_errors_are_not_zhegv(tmp_path: Path) -> None:
     report = run_vasp(
         [sys.executable, "-c", "print('EDDAV: Call to ZHEEV failed.'); raise SystemExit(1)"],
         directory=tmp_path,
+        dispatch=False,
     )
     assert "edddav_zhegv" not in {item.code for item in report.diagnostics}
     assert plan_vasp_remedy(report.diagnostics, directory=tmp_path).give_up

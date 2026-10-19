@@ -66,7 +66,16 @@ The package covers:
 `httk_vasp_run -- vasp_std` of Bash). The attempt's launch prefix, the parallel
 start the workflow manager sets in `HTTK_WORKFLOW_LAUNCH` from the
 `manager.launch_template` setting (or the built-in Slurm prefix), is prepended
-to it; `launch=False` (`--no-launch`) runs the command as given. A command that
+to it; `launch=False` (`--no-launch`) runs the command as given. By default the
+command starts through the launch wrapper {py:mod}`httk.codes.vasp.launch`
+({doc}`details`), which selects the non-collinear (`vasp.ncl_command`) or
+Gamma-only (`vasp.gamma_command`) binary when the inputs need one and the
+setting is configured (otherwise the given command runs), writes
+planned `KPAR`/`NCORE` into the `INCAR` unless it sets them already, and applies
+the prefix itself; `dispatch=False` (`--no-dispatch`) runs the command directly
+behind the prefix, as before. The run report's `process.argv` is then the
+wrapper's command line, not the VASP program's, and the configured variant
+commands are refused like the main one when they start with a launcher. A command that
 already starts with a launcher such as `mpirun` or `srun` is refused when a
 prefix applies. A leftover launcher (for example `vasp.command = "srun -n 32 vasp_std"`) is refused by `run_vasp` with a `ValueError` when a prefix applies; the Python VASP workflows catch only `OSError`, so the attempt ends as a runner error whose message explains the fix, and the Bash runner reports "could not run VASP at all (status 2)" with the explanation on stderr.
 

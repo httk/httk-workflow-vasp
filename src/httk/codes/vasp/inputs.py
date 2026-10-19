@@ -16,6 +16,7 @@ import os
 import random
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
@@ -138,7 +139,18 @@ def automatic_kpoint_grid(
 
     if density <= 0 or minimum < 1 or bump < 0:
         raise ValueError("density must be positive; minimum must be positive; bump cannot be negative")
-    header = read_poscar_header(poscar)
+    lengths = _reciprocal_lengths(read_poscar_header(poscar))
+    values = tuple(max(minimum, math.ceil(density * length + 0.5) + bump) for length in lengths)
+    grid = (values[0], values[1], values[2])
+    if equal:
+        largest = max(grid)
+        return largest, largest, largest
+    return grid
+
+
+def _reciprocal_lengths(header: PoscarHeader) -> tuple[float, float, float]:
+    """Return the reciprocal lattice vector lengths of a POSCAR header in 1/Å, without the factor 2π."""
+
     first, second, third = header.lattice
     determinant = _dot(first, _cross(second, third))
     if abs(determinant) < 1e-12:
@@ -153,13 +165,10 @@ def automatic_kpoint_grid(
         _cross(third, first),
         _cross(first, second),
     )
-    lengths = tuple(math.sqrt(_dot(row, row)) / abs(determinant * scale) for row in reciprocal)
-    values = tuple(max(minimum, math.ceil(density * length + 0.5) + bump) for length in lengths)
-    grid = (values[0], values[1], values[2])
-    if equal:
-        largest = max(grid)
-        return largest, largest, largest
-    return grid
+    first_length, second_length, third_length = (
+        math.sqrt(_dot(row, row)) / abs(determinant * scale) for row in reciprocal
+    )
+    return first_length, second_length, third_length
 
 
 def write_automatic_kpoints(
@@ -212,6 +221,12 @@ def read_incar(path: str | os.PathLike[str] = "INCAR") -> dict[str, str]:
     return result
 
 
+def _true(value: str | None) -> bool:
+    """Return whether an INCAR value is a true Fortran logical (``.TRUE.``, ``T``, ...)."""
+
+    return value is not None and value.strip().lstrip(".")[:1].upper() == "T"
+
+
 def _incar_statement_tag(statement: str) -> str | None:
     """Return the tag one ``NAME = VALUE`` statement assigns, if it assigns one."""
 
@@ -230,7 +245,9 @@ def update_incar(
     :func:`read_incar` reads them all, so an update has to rewrite the individual
     statements of a line rather than drop or keep the whole line: updating
     ``ISYM`` in ``ISPIN = 2 ; ISYM = 2`` leaves ``ISPIN = 2`` and appends the new
-    ``ISYM``, instead of leaving a line that still assigns the old value.
+    ``ISYM``, instead of leaving a line that still assigns the old value. The
+    file keeps its mode, its line endings (CRLF stays CRLF) and a missing final
+    newline.
 
     :param values: Replace these INCAR tag assignments.
     :param path: Update the INCAR file at this path.
@@ -242,8 +259,9 @@ def update_incar(
     normalized = {str(name).strip().upper(): str(value) for name, value in values.items()}
     if not normalized or any(not name or re.fullmatch(r"[A-Z][A-Z0-9_]*", name) is None for name in normalized):
         raise ValueError("INCAR updates require valid nonempty tag names")
+    text = destination.read_text(encoding="utf-8")
     kept: list[str] = []
-    for line in destination.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         comment_match = re.search(r"[#!]", line)
         content = line if comment_match is None else line[: comment_match.start()]
         comment = "" if comment_match is None else line[comment_match.start() :]
@@ -261,14 +279,7 @@ def update_incar(
     # Appended in tag order: the same set of updates then always produces the same
     # file, whatever order the caller's mapping happened to have.
     kept.extend(f"{name} = {value}" for name, value in sorted(normalized.items()))
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write("\n".join(kept) + "\n")
-        os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)
+    _write_text_atomic(destination, "\n".join(kept) + ("\n" if text.endswith("\n") else ""))
     return destination
 
 
@@ -589,10 +600,19 @@ def rattle_poscar(
 
 
 def _write_text_atomic(path: Path, value: str) -> None:
+    """Atomically replace ``path`` with ``value``, keeping an existing file's mode and CRLF line ends."""
+
+    try:
+        mode: int | None = stat.S_IMODE(path.stat().st_mode)
+        crlf = b"\r\n" in path.read_bytes()
+    except FileNotFoundError:
+        mode, crlf = None, False
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        if mode is not None:
+            os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\r\n" if crlf else "\n") as stream:
             stream.write(value)
         os.replace(temporary, path)
     finally:
@@ -630,11 +650,7 @@ def calculate_nbands(
     if divisor is not None and (isinstance(divisor, bool) or divisor < 1):
         raise ValueError("NBANDS divisor must be a positive integer")
     header = read_poscar_header(poscar)
-    text = Path(potcar).read_text(encoding="utf-8", errors="replace")
-    zvals = [float(value) for value in re.findall(r"\bZVAL\s*=\s*([-+0-9.Ee]+)", text)]
-    if len(zvals) < len(header.counts):
-        raise ValueError("POTCAR contains fewer ZVAL entries than POSCAR species")
-    electrons = sum(count * zval for count, zval in zip(header.counts, zvals, strict=False))
+    electrons = _valence_electrons(header, potcar)
     tags = read_incar(incar)
     ispin = int(float(tags.get("ISPIN", "1")))
     natoms = max(6, sum(header.counts))
@@ -657,6 +673,16 @@ def calculate_nbands(
     if divisor is not None and result % divisor:
         result += divisor - result % divisor
     return result
+
+
+def _valence_electrons(header: PoscarHeader, potcar: str | os.PathLike[str]) -> float:
+    """Return the valence electron count: each species' POTCAR ``ZVAL`` times its POSCAR atom count."""
+
+    text = Path(potcar).read_text(encoding="utf-8", errors="replace")
+    zvals = [float(value) for value in re.findall(r"\bZVAL\s*=\s*([-+0-9.Ee]+)", text)]
+    if len(zvals) < len(header.counts):
+        raise ValueError("POTCAR contains fewer ZVAL entries than POSCAR species")
+    return sum(count * zval for count, zval in zip(header.counts, zvals, strict=False))
 
 
 def _expanded_sum(value: str) -> float:

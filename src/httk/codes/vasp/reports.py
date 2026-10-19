@@ -9,6 +9,8 @@ classified :class:`VaspRunReport`. Historical authorship is documented in
 
 import os
 import re
+import shlex
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -103,12 +105,19 @@ def run_vasp(
     launch: bool | None = None,
     termination_grace: float = 10.0,
     report_path: str | os.PathLike[str] = "vasp-run-report.json",
+    dispatch: bool = True,
 ) -> VaspRunReport:
     """Run VASP with live VASP-5/6 diagnostics and a structured report.
 
-    The followed ``OUTCAR`` and ``OSZICAR`` are removed before VASP starts, so a
-    stale file from an earlier run cannot replay its diagnostics into this one;
-    VASP rewrites both anyway. ``CONTCAR`` and the run report are not touched.
+    By default VASP starts through the launch wrapper :mod:`httk.codes.vasp.launch`:
+    *argv* is its standard command, the ``vasp.ncl_command`` and
+    ``vasp.gamma_command`` settings (job parameter, ``HTTK_`` variable or
+    workspace setting) its non-collinear and Gamma-only commands (*argv* again for
+    a non-collinear run when ``vasp.ncl_command`` is unset), and the wrapper
+    writes the planned ``KPAR``/``NCORE`` into ``INCAR`` and applies the launch
+    prefix. The followed ``OUTCAR`` and ``OSZICAR`` are removed before VASP
+    starts, so a stale file from an earlier run cannot replay its diagnostics into
+    this one; VASP rewrites both anyway. ``CONTCAR`` and the run report are not touched.
 
     :param argv: Execute this VASP command argument vector, naming the program (for example ``["vasp_std"]``).
         The attempt's launch prefix (``HTTK_WORKFLOW_LAUNCH``) is prepended by default; a command that already
@@ -119,7 +128,11 @@ def run_vasp(
         ``False`` runs *argv* as given.
     :param termination_grace: Allow this duration for graceful termination.
     :param report_path: Write the structured report at this workdir-relative path.
-    :return: The classified VASP run report.
+    :param dispatch: Start VASP through the launch wrapper, the default; ``False`` runs *argv*
+        (behind the launch prefix) without binary selection or parallelization planning.
+    :return: The classified VASP run report; its ``process.argv`` is the wrapper command line when dispatching.
+    :raises ValueError: If a command, or a configured ``vasp.ncl_command``/``vasp.gamma_command``,
+        starts with a launcher while a launch prefix applies.
     """
 
     root = Path(directory).resolve()
@@ -129,9 +142,37 @@ def run_vasp(
     )
     for source in follow:
         source.path.unlink(missing_ok=True)
+    # Refuses a leading launcher before anything starts, with or without the wrapper.
+    command = launch_command(argv, launch=launch is not False)
+    if dispatch:
+        # Imported here: the package importing launch would make ``python -m httk.codes.vasp.launch`` warn.
+        from .launch import _setting
+
+        variants = {
+            name: str(value) for name in ("vasp.ncl_command", "vasp.gamma_command") if (value := _setting(name))
+        }
+        for name, value in variants.items():
+            try:
+                launch_command(shlex.split(value), launch=launch is not False)
+            except ValueError as exc:
+                raise ValueError(f"the {name} setting: {exc}") from exc
+        standard = shlex.join(argv)
+        # Without vasp.ncl_command, a non-collinear INCAR runs argv as it did before the wrapper.
+        command = [
+            sys.executable,
+            "-P",
+            "-m",
+            "httk.codes.vasp.launch",
+            f"--standard={standard}",
+            f"--ncl={variants.get('vasp.ncl_command', standard)}",
+        ]
+        if "vasp.gamma_command" in variants:
+            command.append(f"--gamma={variants['vasp.gamma_command']}")
+        if launch is False:
+            command.append("--no-launch")
     supervisor = ProcessSupervisor(monitors=(_VaspMonitor(),), follow=follow)
     process = supervisor.run(
-        launch_command(argv, launch=launch is not False),
+        command,
         timeout=timeout,
         cwd=root,
         termination_grace=termination_grace,

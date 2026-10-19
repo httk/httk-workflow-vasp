@@ -132,11 +132,32 @@ without the manual rank reduction, using this library revision, and inspect
 the applied ladder, effective parallelization and converged output. That
 cluster check remains to be performed by the supervisor/operator.
 
-## Variant dispatch
+## Launch wrapper
 
-{py:mod}`httk.codes.vasp.launch` picks the VASP binary a calculation's inputs
-need where those inputs exist, for launchers that run one configured command
-(custodian, and so atomate2) while the INCAR is only written inside the job.
+{py:mod}`httk.codes.vasp.launch` is the default way VASP starts. It runs once
+per launch, in the attempt and in front of the launch prefix, where the
+calculation's `INCAR`, `POSCAR`, `POTCAR` and `KPOINTS` and the attempt's rank
+count are all known. It selects the VASP binary, plans the parallelization tags
+`KPAR` and `NCORE`, writes them into the `INCAR`, and then replaces itself with
+the attempt's launch prefix (`HTTK_WORKFLOW_LAUNCH`) followed by the selected
+binary:
+
+```text
+python -P -m httk.codes.vasp.launch --standard vasp_std --ncl vasp_ncl --gamma vasp_gam
+```
+
+{py:func}`~httk.codes.vasp.run_vasp`, and through it the Bash `httk_vasp_run`,
+starts VASP this way by default, with its command as `--standard`, the
+`vasp.ncl_command` and `vasp.gamma_command` settings as `--ncl` and `--gamma`
+(its own command again as `--ncl` when that setting is unset, so a run keeps the
+command it was given), and `--no-launch` for `launch=False`; `dispatch=False`
+(`--no-dispatch`) bypasses the wrapper. Under atomate2 the VASP command mapping of
+*httk-workflow*'s jobflow runner names the wrapper, in front of the launch
+prefix, as all three `ATOMATE2_VASP_*CMD` commands, so atomate2 and the native
+workflows plan their parallelization identically.
+
+### Binary selection
+
 {py:func}`~httk.codes.vasp.launch.select_vasp_command` reads `INCAR` and
 `KPOINTS` in a directory and returns:
 
@@ -152,29 +173,95 @@ need where those inputs exist, for launchers that run one configured command
   fully automatic files also select the standard command;
 - the standard command otherwise.
 
-Its command-line form selects for the current directory and replaces itself
-with the chosen command:
+Each command is one shlex-quoted string; `--ncl` and `--gamma` are optional.
+`--directory` reads and updates the inputs in another directory (the command
+still runs in the current one), and `--no-launch` execs the command without the
+launch prefix.
 
-```text
-srun … python -m httk.codes.vasp.launch --standard vasp_std --ncl vasp_ncl --gamma vasp_gam
-```
+### Parallelization planning
 
-It sits behind the attempt's launch prefix, so every MPI rank reads the inputs
-and execs the right binary. Each command is one shlex-quoted string; `--ncl` and
-`--gamma` are optional, and `--directory` reads the inputs from another
-directory (the command still runs in the current one). The commands travel in
-argv, not the environment, because a confined launch drops `HTTK_`-prefixed
-variables from rank environments. When no command can be selected or executed
-it prints `httk.codes.vasp.launch: <reason>` to stderr and exits with status 2;
-a program that cannot be executed is named together with the variant
-(`--standard`, `--ncl` or `--gamma`) that selected it. Under atomate2 the job
-reports only "Job return code is 2": custodian redirects stderr, so the reason
-is in the calculation directory's `std_err.txt`, once per rank. Importing the
-module imports the package {py:mod}`httk.codes.vasp` and through it
-*httk-core* and numpy, which costs about 0.3 s per rank before the exec;
-pymatgen is never imported.
-{py:func}`~httk.codes.vasp.run_vasp` and the native runners do not use the
-dispatcher yet.
+VASP splits its ranks into `KPAR` k-point groups and each group into
+`NPAR = ranks / KPAR / NCORE` band groups, and rounds `NBANDS` up to a multiple
+of `NPAR`. Left at VASP's defaults (`KPAR = NCORE = 1`) a small cell on many
+ranks is rounded far above the bands it asked for: a diamond band structure
+with `NBANDS = 39` on 32 ranks runs 64 bands, and custodian refuses a run whose
+rounded `NBANDS` exceeds `2 × NELECT` as unrecoverable.
+{py:func}`~httk.codes.vasp.parallel.plan_parallelization` decides, in this order:
+
+1. **Explicit wins.** An `INCAR` that sets `NCORE`, `NPAR` or `KPAR` gets
+   nothing written. When it also sets `NBANDS` and VASP's rounding under those
+   tags would raise `NBANDS` above `2 × NELECT`, a warning says so and names
+   custodian's refusal; another warns when the ranks do not split evenly into
+   `KPAR` groups by `NPAR` (or `NCORE` when `NPAR` is unset). `NELECT` is the POTCAR `ZVAL` times the POSCAR
+   counts, or the `INCAR`'s `NELECT`.
+2. **Left to VASP.** DFPT and linear response (`LEPSILON`, `LCALCEPS`,
+   `IBRION = 7, 8`), hybrid functionals (`LHFCALC`), `ALGO` values starting
+   with `GW`, `BSE`, `ACFDT` or `RPA`, nudged elastic band runs (`IMAGES`), and
+   single-rank runs get nothing.
+3. **KPAR** is the largest divisor of the rank count that is at most a lower
+   bound on the irreducible k-points and leaves every k-point group at least
+   `ceil(NIONS / 2)` ranks, so a large cell keeps its ranks for bands and plane
+   waves. The bound is the point count of an explicit list, segments × points of
+   a line-mode file, and for a mesh (Gamma, Monkhorst-Pack, fully automatic, or
+   derived from `KSPACING` (default 0.5) when there is no `KPOINTS`) its size
+   divided by 48, the largest Laue-group order: exact counting needs symmetry
+   code this package does not carry. `LELF` and `LOPTICS` force `KPAR = 1`;
+   `NCORE` is still planned for them.
+4. **NCORE** is chosen among the divisors of the k-point group size that also
+   divide the ranks per node when the binding says so. With an explicit
+   `NBANDS` it is the candidate closest to 8 (from below first) that keeps
+   `NBANDS` a multiple of `NPAR`, or the whole group (`NPAR = 1`) when none does,
+   so `NBANDS` is never changed. Without one it is the largest candidate up to
+   8, raised until VASP's default band count rounded up to `NPAR` is unchanged
+   or stays at most `2 × NELECT`. That bound only keeps NPAR rounding from
+   inflating the default: VASP prints "The number of bands has been changed"
+   only for an `NBANDS` set in the INCAR, so custodian's refusal concerns the
+   explicit case alone. The default is VASP's `main.F` formula,
+   `max(floor((NELECT + 2) / 2) + max(floor(NIONS / 2), 3), floor(0.6 NELECT))`,
+   plus `floor((ΣMAGMOM + 1) / 2)` for `ISPIN = 2` and doubled for a
+   non-collinear run (pymatgen's `estimate_nbands` notes it differs from the
+   VASP wiki).
+
+A planned value of 1 is VASP's default and is not written, so the INCAR stays
+minimal. The rank count is `--ranks` when given. Otherwise the launcher's own
+flags win (the prefix's, or without a prefix the command's): `-n`, `-np` or
+`--ntasks`, else `--ntasks-per-node` times the binding's node count. With a
+prefix and no such flag, the attempt context's binding gives it (the sum of
+each node's `procs`, whose common divisor bounds `NCORE`), else its
+`resources` `procs`. Hybrid MPI/OpenMP runs (more than one thread per rank,
+from an explicit `OMP_NUM_THREADS` in the prefix or the environment, else
+`--cpus-per-task` or srun's `-c`), a thread flag without a rank count, a count
+below 1, and a binding with GPUs leave it unknown. When it is unknown nothing is
+planned, and the log line says why.
+
+Planning is on unless `--parallel off` is passed or the setting
+`vasp.parallelization` is `off`, resolved like other `vasp.*` settings: job
+parameter, then the `HTTK_VASP_PARALLELIZATION` variable, then the workspace
+setting, then `auto`. Any other value, including a boolean, is refused. Inputs the planner cannot
+read leave the `INCAR` unchanged and VASP still starts.
+
+Every launch records its decision as one line
+`httk.codes.vasp.launch: parallel: <reason>` on stderr (custodian keeps it in
+the calculation directory's `std_err.txt`) and appends it, time-stamped, to
+`httk-vasp-launch.log` in the directory, so the history of reruns stays
+visible; warnings follow as `warning:` lines. Because the written tags are
+explicit on the next launch, a rerun rewrites nothing and logs that the INCAR
+sets them. The same rule makes custodian's own fixes stick: `KPAR = 1` for
+`LELF`, `NCORE = 1` for `ZPOTRF` on small cells, a doubled `NCORE`, or a raised
+`NBANDS` are all respected, and removing `NCORE`/`NPAR` for DFPT leaves a run
+the planner does not touch. The flip side: a step that copies an earlier
+step's INCAR (atomate2's `VASP_INHERIT_INCAR`, off by default) inherits that
+step's planned tags, which may not suit its own rank count; leave inheriting
+off, or set the tags explicitly for such runs. The INCAR keeps its file mode
+and line endings when the tags are written.
+
+When no command can be selected or executed, or `vasp.parallelization` is
+invalid, the wrapper prints `httk.codes.vasp.launch: <reason>` to stderr and
+exits with status 2; a program that cannot be executed is named together with
+the variant (`--standard`, `--ncl` or `--gamma`) that selected it, or as the
+launch prefix. Under atomate2 the job reports only "Job return code is 2":
+custodian redirects stderr, so the reason is in `std_err.txt`. pymatgen is
+never imported.
 
 ## Dependencies
 

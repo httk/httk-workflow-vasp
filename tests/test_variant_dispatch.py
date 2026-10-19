@@ -1,5 +1,7 @@
 """The VASP variant dispatcher selects and execs the binary the inputs need."""
 
+import json
+import os
 import shlex
 import subprocess
 import sys
@@ -100,3 +102,91 @@ def test_main_names_a_missing_program(tmp_path: Path) -> None:
     result = _launch(tmp_path, "LSORBIT = .TRUE.\n", "--ncl", "no-such-vasp_ncl -x")
     assert result.returncode == 2
     assert "'no-such-vasp_ncl' (the --ncl command)" in result.stderr
+
+
+_RECORDER = """#!{python}
+import json, os, sys
+with open({log!r}, "a") as stream:
+    stream.write(json.dumps([sys.argv[0].rsplit("/", 1)[-1], *sys.argv[1:], os.getcwd()]) + "\\n")
+{tail}
+"""
+
+
+def _fake_tools(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    """Return a calculation directory and an environment with a fake ``vasp_std`` and launch prefix."""
+
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    log = str(tmp_path / "exec.log")
+    for name, tail in (("vasp_std", ""), ("fake-srun", "os.execvp(sys.argv[3], sys.argv[3:])")):
+        (tools / name).write_text(_RECORDER.format(python=sys.executable, log=log, tail=tail), encoding="utf-8")
+        (tools / name).chmod(0o755)
+    calculation = tmp_path / "calc"
+    calculation.mkdir()
+    (calculation / "INCAR").write_text("IBRION = 2\n", encoding="utf-8")
+    (calculation / "POSCAR").write_text(
+        "diamond\n1.0\n0 1.78 1.78\n1.78 0 1.78\n1.78 1.78 0\nC\n2\nDirect\n0 0 0\n0.25 0.25 0.25\n", encoding="utf-8"
+    )
+    (calculation / "POTCAR").write_text("ZVAL = 4.0\n", encoding="utf-8")
+    (calculation / "KPOINTS").write_text("mesh\n0\nGamma\n11 11 11\n", encoding="utf-8")
+    environment = dict(os.environ)
+    environment["PATH"] = f"{tools}{os.pathsep}{environment['PATH']}"
+    environment["HTTK_WORKFLOW_LAUNCH"] = "fake-srun -n 32"
+    environment.pop("HTTK_WORKFLOW_CONTEXT", None)
+    return calculation, environment
+
+
+def _wrap(calculation: Path, environment: dict[str, str], *arguments: str) -> subprocess.CompletedProcess[str]:
+    argv = [sys.executable, "-P", "-m", "httk.codes.vasp.launch", "--standard", "vasp_std", *arguments]
+    return subprocess.run(argv, cwd=calculation, env=environment, capture_output=True, text=True, check=False)
+
+
+def test_wrapper_plans_once_and_execs_prefix_then_binary(tmp_path: Path) -> None:
+    calculation, environment = _fake_tools(tmp_path)
+    first = _wrap(calculation, environment)
+    assert first.returncode == 0, first.stderr
+    assert "parallel: 32 ranks, KPAR=16 NCORE=2" in first.stderr and "wrote KPAR=16 NCORE=2" in first.stderr
+    second = _wrap(calculation, environment)
+    assert second.returncode == 0, second.stderr
+    assert "INCAR sets NCORE=2 KPAR=16" in second.stderr and "INCAR unchanged" in second.stderr
+    incar = (calculation / "INCAR").read_text(encoding="utf-8")
+    assert incar.count("KPAR") == 1 and incar.count("NCORE") == 1
+    records = [json.loads(line) for line in (tmp_path / "exec.log").read_text(encoding="utf-8").splitlines()]
+    expected = [["fake-srun", "-n", "32", "vasp_std", str(calculation)], ["vasp_std", str(calculation)]]
+    assert records == expected * 2
+    assert len((calculation / "httk-vasp-launch.log").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_wrapper_parallel_off_and_ranks_override(tmp_path: Path) -> None:
+    calculation, environment = _fake_tools(tmp_path)
+    assert _wrap(calculation, environment, "--parallel", "off").returncode == 0
+    assert (calculation / "INCAR").read_text(encoding="utf-8") == "IBRION = 2\n"
+    environment["HTTK_VASP_PARALLELIZATION"] = "off"
+    assert _wrap(calculation, environment).returncode == 0
+    assert (calculation / "INCAR").read_text(encoding="utf-8") == "IBRION = 2\n"
+    result = _wrap(calculation, environment, "--parallel", "auto", "--ranks", "4", "--no-launch")
+    assert result.returncode == 0, result.stderr
+    assert "4 ranks" in result.stderr and "ranks from --ranks" in result.stderr
+    assert "KPAR = 4" in (calculation / "INCAR").read_text(encoding="utf-8")
+    assert len((calculation / "httk-vasp-launch.log").read_text(encoding="utf-8").splitlines()) == 3
+
+
+def test_wrapper_refuses_an_unknown_parallelization_setting(tmp_path: Path) -> None:
+    calculation, environment = _fake_tools(tmp_path)
+    environment["HTTK_VASP_PARALLELIZATION"] = "maybe"
+    result = _wrap(calculation, environment)
+    assert result.returncode == 2 and "vasp.parallelization must be" in result.stderr
+    assert not (tmp_path / "exec.log").exists()
+
+
+@pytest.mark.parametrize("value", [False, True, 1, "maybe"])
+def test_main_refuses_a_non_string_parallelization_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], value: object
+) -> None:
+    from httk.codes.vasp.launch import main
+
+    (tmp_path / "INCAR").write_text("ENCUT = 520\n", encoding="utf-8")
+    (tmp_path / "job.json").write_text(json.dumps({"parameters": {"vasp.parallelization": value}}), encoding="utf-8")
+    monkeypatch.setenv("HTTK_WORKFLOW_JOB_DIR", str(tmp_path))
+    assert main(["--standard", "no-such-vasp", "--directory", str(tmp_path)]) == 2
+    assert "vasp.parallelization must be 'auto' or 'off'" in capsys.readouterr().err

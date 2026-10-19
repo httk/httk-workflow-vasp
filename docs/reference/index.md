@@ -3,8 +3,9 @@
 This is the generated API reference. It documents the deliberate public surface
 of the package: the facade `httk.codes.vasp`, which re-exports the helpers of
 its internal `inputs`, `diagnostics`, `remedies` and `reports` modules, and the
-collect-hook helpers in `httk.codes.vasp.collect`, and the VASP variant
-dispatcher `httk.codes.vasp.launch`. The `httk.registry.codes.vasp`
+collect-hook helpers in `httk.codes.vasp.collect`, the VASP launch wrapper
+`httk.codes.vasp.launch` and its parallelization planner
+`httk.codes.vasp.parallel`. The `httk.registry.codes.vasp`
 registration package and the private `vasp-*` bridge module are not part of it.
 
 ```{toctree}

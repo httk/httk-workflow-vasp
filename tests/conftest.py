@@ -18,3 +18,12 @@ def _isolated_httk_config(tmp_path_factory: pytest.TempPathFactory, monkeypatch:
     monkeypatch.setenv("HTTK_DATA_HOME", str(tmp_path_factory.mktemp("httk-store")))
     # A developer's launch prefix must not leak into the tests.
     monkeypatch.delenv("HTTK_WORKFLOW_LAUNCH", raising=False)
+    # Nor an attempt context or VASP setting, which the launch wrapper reads.
+    for variable in (
+        "HTTK_WORKFLOW_CONTEXT",
+        "HTTK_WORKFLOW_JOB_DIR",
+        "HTTK_VASP_PARALLELIZATION",
+        "HTTK_VASP_NCL_COMMAND",
+        "HTTK_VASP_GAMMA_COMMAND",
+    ):
+        monkeypatch.delenv(variable, raising=False)

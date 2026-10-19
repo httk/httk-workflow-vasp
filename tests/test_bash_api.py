@@ -107,7 +107,7 @@ Path("OSZICAR").write_text("")
 """,
         encoding="utf-8",
     )
-    report = run_vasp([sys.executable, str(program)], directory=tmp_path, termination_grace=0.1)
+    report = run_vasp([sys.executable, str(program)], directory=tmp_path, termination_grace=0.1, dispatch=False)
     assert report.classification == "diagnosed_stop"
     assert {item.code for item in report.diagnostics} >= {
         "tetrahedron_kpoints",
@@ -137,7 +137,7 @@ Path("OUTCAR").write_text("vasp.6.4\\nGeneral timing and accounting informations
 """,
         encoding="utf-8",
     )
-    report = run_vasp([sys.executable, str(program)], directory=tmp_path, termination_grace=0.1)
+    report = run_vasp([sys.executable, str(program)], directory=tmp_path, termination_grace=0.1, dispatch=False)
     assert report.classification == "completed", report.diagnostics
     assert report.process.returncode == 0
     assert (tmp_path / "CONTCAR").read_text(encoding="utf-8") == "kept\n"
