@@ -145,12 +145,12 @@ def test_wrapper_plans_once_and_execs_prefix_then_binary(tmp_path: Path) -> None
     calculation, environment = _fake_tools(tmp_path)
     first = _wrap(calculation, environment)
     assert first.returncode == 0, first.stderr
-    assert "parallel: 32 ranks, KPAR=16 NCORE=2" in first.stderr and "wrote KPAR=16 NCORE=2" in first.stderr
+    assert "parallel: 32 ranks, KPAR=32 NCORE=1" in first.stderr and "wrote KPAR=32\n" in first.stderr
     second = _wrap(calculation, environment)
     assert second.returncode == 0, second.stderr
-    assert "INCAR sets NCORE=2 KPAR=16" in second.stderr and "INCAR unchanged" in second.stderr
+    assert "INCAR sets KPAR=32" in second.stderr and "INCAR unchanged" in second.stderr
     incar = (calculation / "INCAR").read_text(encoding="utf-8")
-    assert incar.count("KPAR") == 1 and incar.count("NCORE") == 1
+    assert incar.count("KPAR") == 1 and "NCORE" not in incar
     records = [json.loads(line) for line in (tmp_path / "exec.log").read_text(encoding="utf-8").splitlines()]
     expected = [["fake-srun", "-n", "32", "vasp_std", str(calculation)], ["vasp_std", str(calculation)]]
     assert records == expected * 2

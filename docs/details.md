@@ -203,9 +203,13 @@ rounded `NBANDS` exceeds `2 × NELECT` as unrecoverable.
    `ceil(NIONS / 2)` ranks, so a large cell keeps its ranks for bands and plane
    waves. The bound is the point count of an explicit list, segments × points of
    a line-mode file, and for a mesh (Gamma, Monkhorst-Pack, fully automatic, or
-   derived from `KSPACING` (default 0.5) when there is no `KPOINTS`) its size
-   divided by 48, the largest Laue-group order: exact counting needs symmetry
-   code this package does not carry. `LELF` and `LOPTICS` force `KPAR = 1`;
+   derived from `KSPACING` (default 0.5, Gamma-centred unless `KGAMMA` is
+   false) when there is no `KPOINTS`) the number of orbits of the lattice's
+   point group that meet the mesh, the group found after Delaunay reduction of
+   the POSCAR basis. That is a lower bound on VASP's irreducible count, since
+   the crystal's point group is a subgroup of the lattice's; counting stops at
+   the rank count. A mesh file with a nonzero shift uses the mesh size divided
+   by 48, the largest point-group order. `LELF` and `LOPTICS` force `KPAR = 1`;
    `NCORE` is still planned for them.
 4. **NCORE** is chosen among the divisors of the k-point group size that also
    divide the ranks per node when the binding says so. With an explicit

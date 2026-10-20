@@ -38,8 +38,8 @@ def _write(tmp_path: Path, incar: str, kpoints: str | None = _mesh("11 11 11"), 
         # Diamond non-self-consistent bands: one band group per k-point group keeps NBANDS = 39.
         ("ICHARG = 11\nNBANDS = 39\n", LINE_MODE, DIAMOND, 32, 32, (32, None)),
         ("ICHARG = 11\nNBANDS = 39\n", _mesh("21 21 21"), DIAMOND, 32, 32, (32, None)),
-        # Diamond relaxation: 11x11x11 bounds 28 k-points, so KPAR = 16 and two ranks per group.
-        ("IBRION = 2\nISIF = 3\n", _mesh("11 11 11"), DIAMOND, 32, None, (16, 2)),
+        # Diamond relaxation: 11x11x11 has 56 irreducible k-points (counted up to 32), so KPAR = 32.
+        ("IBRION = 2\nISIF = 3\n", _mesh("11 11 11"), DIAMOND, 32, None, (32, None)),
         # A large supercell with one k-point keeps all ranks for bands, NCORE within a node.
         ("ENCUT = 520\n", _mesh("2 2 2"), SUPERCELL, 64, 32, (None, 8)),
         # LELF needs KPAR = 1; NCORE is still planned.
@@ -137,16 +137,74 @@ def test_incar_nelect_overrides_the_potcar(tmp_path: Path) -> None:
         ("", LINE_MODE, DIAMOND, 60),
         ("", LINE_MODE + "! a comment\n# another\n", DIAMOND, 60),
         ("", "explicit\n5\nReciprocal\n" + "0 0 0 1\n" * 5, DIAMOND, 5),
-        ("", _mesh("4 4 4"), DIAMOND, 2),
-        ("", "auto\n0\nAuto\n20\n", CUBIC, 2),
-        ("KSPACING = 0.2\n", None, CUBIC, 8),
-        ("", None, CUBIC, 1),
+        ("", _mesh("4 4 4"), DIAMOND, 8),
+        # Length 20 on a = 5 is a 4x4x4 Gamma mesh; KSPACING 0.2 gives 7x7x7, the default 0.5 3x3x3.
+        ("", "auto\n0\nAuto\n20\n", CUBIC, 10),
+        ("KSPACING = 0.2\n", None, CUBIC, 20),
+        ("KSPACING = 0.2\nKGAMMA = .FALSE.\n", None, CUBIC, 20),
+        ("KSPACING = 0.35\nKGAMMA = .FALSE.\n", None, CUBIC, 4),
+        ("", None, CUBIC, 4),
+        ("", "mesh\n0\nGamma\n0 4 4\n", CUBIC, 1),
         ("", "bad\n", CUBIC, 1),
     ],
 )
 def test_kpoint_bounds(tmp_path: Path, incar: str, kpoints: str | None, poscar: str, expected: int) -> None:
     root = _write(tmp_path, incar or "ENCUT = 520\n", kpoints, poscar)
     assert _kpoint_bound(root, read_incar(root / "INCAR"), read_poscar_header(root / "POSCAR"))[0] == expected
+
+
+T1 = (
+    "C2\n1.0\n0 1.7771847853521903 1.7771847853521903\n1.7593231784017298 0 1.7771847853521903\n"
+    "1.7593231784017300 1.7771847853521903 0\nC\n2\nDirect\n0 0 0\n0.5 0.5 0.5\n"
+)
+DIAMOND_SKEWED = DIAMOND.replace("1.78 1.78 0\n", "1.78 5.34 3.56\n")
+CUBIC_SKEWED = CUBIC.replace("0 5 0\n", "5 5 0\n")
+S1 = (
+    "C2\n1.0\n0 1.7416410896451464 1.7768293128443136\n1.7771847853521903 -0.0355436957070438 1.7768293128443136\n"
+    "1.7771847853521905 1.7771847853521903 0\nC\n2\nDirect\n0 0 0\n0.5 0.5 0.5\n"
+)
+
+
+# Irreducible k-points under the lattice point group: VASP's NKPTS for the diamond, T1 (body-centred
+# tetragonal, 16 operations) and S1 (8 operations) cells; the 216-atom cubic cell's 4 is below the 6
+# VASP found for the displaced crystal, as a lower bound may be.
+@pytest.mark.parametrize(
+    ("kpoints", "poscar", "expected"),
+    [
+        (_mesh("11 11 11"), DIAMOND, 56),
+        (_mesh("13 13 13"), DIAMOND, 84),
+        (_mesh("4 4 4"), DIAMOND, 8),
+        (_mesh("15 15 15"), T1, 288),
+        (_mesh("15 15 15"), S1, 512),
+        (_mesh("2 2 2"), SUPERCELL, 4),
+        (_mesh("4 4 4"), CUBIC, 10),
+        (_mesh("3 3 3"), CUBIC, 4),
+        (_mesh("7 7 7"), CUBIC, 20),
+        ("mp\n0\nMonkhorst-Pack\n4 4 4\n", CUBIC, 4),
+        # Non-reduced bases of the same lattices (a3 + 2 a1 for diamond, a2 + a1 for cubic) count the same.
+        (_mesh("11 11 11"), DIAMOND_SKEWED, 56),
+        (_mesh("4 4 4"), DIAMOND_SKEWED, 8),
+        (_mesh("4 4 4"), CUBIC_SKEWED, 10),
+        # A non-uniform mesh counts full-group orbits that meet it, whether or not an operation keeps the mesh.
+        (_mesh("2 4 4"), DIAMOND, 8),
+        # The transposed action (k -> N^T k) gives 2 and 10 here.
+        (_mesh("1 2 2"), DIAMOND, 3),
+        ("mp\n0\nMonkhorst-Pack\n2 4 4\n", T1, 7),
+        # A shifted mesh falls back to its size over 48; a zero shift is no shift.
+        (_mesh("4 4 4") + "0.5 0.5 0.5\n", CUBIC, 2),
+        (_mesh("4 4 4") + "0 0 0\n", CUBIC, 10),
+    ],
+)
+def test_mesh_orbits(tmp_path: Path, kpoints: str, poscar: str, expected: int) -> None:
+    root = _write(tmp_path, "ENCUT = 520\n", kpoints, poscar)
+    assert _kpoint_bound(root, read_incar(root / "INCAR"), read_poscar_header(root / "POSCAR"))[0] == expected
+
+
+def test_mesh_count_stops_at_the_limit(tmp_path: Path) -> None:
+    root = _write(tmp_path, "ENCUT = 520\n")
+    incar, header = read_incar(root / "INCAR"), read_poscar_header(root / "POSCAR")
+    assert _kpoint_bound(root, incar, header, limit=5)[0] == 5
+    assert _kpoint_bound(root, incar, header, limit=None)[0] == 56
 
 
 PREFIX = ["env", "SLURM_HOSTFILE=f", "srun", "--ntasks=24", "--cpus-per-task=1"]

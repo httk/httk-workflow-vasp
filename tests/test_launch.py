@@ -64,7 +64,7 @@ def test_run_vasp_goes_through_the_wrapper(tmp_path: Path, monkeypatch: pytest.M
         "--ncl=vasp_ncl",
     )
     incar = (tmp_path / "INCAR").read_text(encoding="utf-8")
-    assert "KPAR = 16" in incar and "NCORE = 2" in incar
+    assert "KPAR = 32" in incar and "NCORE" not in incar
     assert "parallel: 32 ranks" in (tmp_path / "vasp.err").read_text(encoding="utf-8")
 
 
