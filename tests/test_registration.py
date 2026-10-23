@@ -8,6 +8,17 @@ import httk.core  # noqa: F401  (importing httk.core runs registry discovery)
 from httk.core.register import code_support, known_codes
 
 
+def test_vasp_declares_its_application_settings() -> None:
+    assert code_support("vasp").settings == (
+        "vasp.command",
+        "vasp.gamma_command",
+        "vasp.nbands_rounding",
+        "vasp.ncl_command",
+        "vasp.parallelization",
+        "vasp.pseudo_library",
+    )
+
+
 def test_vasp_is_a_known_code_with_its_packaged_bash_api() -> None:
     assert "vasp" in known_codes()
     support = code_support("vasp")
