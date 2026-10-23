@@ -1,4 +1,4 @@
-"""Plan VASP's ``KPAR`` and ``NCORE`` from a calculation's inputs and rank count.
+"""Plan VASP's ``KPAR``, ``NCORE`` and ``NBANDS`` from a calculation's inputs and rank count.
 
 VASP splits its ranks into ``KPAR`` k-point groups and each group into
 ``NPAR = ranks / KPAR / NCORE`` band groups, and rounds ``NBANDS`` up to a
@@ -9,7 +9,14 @@ custodian refuses the run as unrecoverable once the rounded value exceeds twice
 ``NELECT``; VASP's own default count is rounded silently, which only wastes
 time. :func:`plan_parallelization` chooses the two
 tags just before VASP starts, when every input and the rank count are known; the
-launch wrapper :mod:`httk.codes.vasp.launch` writes them into the INCAR.
+launch wrapper :mod:`httk.codes.vasp.launch` writes them into the INCAR and then,
+unless ``vasp.nbands_rounding`` is ``off``, rounds ``NBANDS`` itself: an explicit
+value up to a multiple of ``NPAR``, an absent one to VASP's default made explicit
+and divisible, in both cases only while the result stays at most ``2 NELECT``. A
+value it writes carries the comment ``# httk: rounded from BASE for NPAR N``
+(``BASE`` is ``default M`` for VASP's default), so a later launch on other ranks
+rounds from ``BASE`` again instead of ratcheting up; an edited value loses that
+status and counts as explicit.
 """
 
 import itertools
@@ -25,6 +32,7 @@ from .inputs import (
     _expanded_sum,
     _reciprocal_lengths,
     _true,
+    _updated_incar,
     _valence_electrons,
     read_incar,
     read_poscar_header,
@@ -36,6 +44,13 @@ __all__ = ["ParallelPlan", "plan_parallelization"]
 _PREFERRED_NCORE = 8
 #: VASP's KSPACING when neither a KPOINTS file nor the tag is present.
 _DEFAULT_KSPACING = 0.5
+#: An NBANDS line the launch wrapper wrote: value, marker comment, ``default ``, base, NPAR.
+_MARKER = re.compile(
+    r"^[ \t]*NBANDS[ \t]*=[ \t]*(\d+)[ \t]*(#[ \t]*httk: rounded from (default )?(\d+) for NPAR ([1-9]\d*))[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+#: A marker comment on a line of its own.
+_BARE_MARKER = re.compile(r"^[ \t]*#[ \t]*httk: rounded from.*(?:\n|\Z)", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -231,6 +246,38 @@ def _default_nbands(nelect: float, nions: int, incar: Mapping[str, str]) -> int:
     return nbands
 
 
+def _marker(text: str, incar: Mapping[str, str]) -> re.Match[str] | None:
+    """Return the launch wrapper's NBANDS marker when the INCAR still holds the value it wrote, else ``None``."""
+
+    found = list(_MARKER.finditer(text))
+    if not found or "NBANDS" not in incar:
+        return None
+    match = found[-1]
+    value = int(match[1])
+    if value != int(float(incar["NBANDS"])) or value != _rounded(int(match[4]), int(match[5])):
+        return None
+    return match
+
+
+def _requested_nbands(text: str, incar: Mapping[str, str]) -> int | None:
+    """Return the NBANDS the INCAR asks for: a value the wrapper rounded counts as its base, ``None`` as VASP's default."""
+
+    match = _marker(text, incar)
+    if match is not None:
+        return None if match[3] else int(match[4])
+    return int(float(incar["NBANDS"])) if "NBANDS" in incar else None
+
+
+def _band_groups(incar: Mapping[str, str], ranks: int) -> int:
+    """Return VASP's band-group count ``NPAR`` for the INCAR's explicit tags on ``ranks`` ranks."""
+
+    # VASP takes NPAR over NCORE when both are set.
+    if "NPAR" in incar:
+        return max(1, int(float(incar["NPAR"])))
+    split = int(float(incar.get("KPAR", "1"))) * int(float(incar.get("NCORE", "1")))
+    return max(1, ranks // max(1, split))
+
+
 def _left_alone(incar: Mapping[str, str], ranks: int) -> str | None:
     """Return why a run gets no planned tags, or ``None`` when it is planned."""
 
@@ -249,13 +296,18 @@ def _left_alone(incar: Mapping[str, str], ranks: int) -> str | None:
 
 
 def plan_parallelization(
-    directory: str | os.PathLike[str] = ".", *, ranks: int, ranks_per_node: int | None = None
+    directory: str | os.PathLike[str] = ".",
+    *,
+    ranks: int,
+    ranks_per_node: int | None = None,
+    nbands_rounding: str = "off",
 ) -> ParallelPlan:
     """Plan ``KPAR`` and ``NCORE`` for the VASP inputs in ``directory`` on ``ranks`` ranks.
 
     An INCAR that sets ``NCORE``, ``NPAR`` or ``KPAR`` is respected and gets
     nothing, with a warning when its explicit ``NBANDS`` would be rounded above
-    ``2 NELECT`` (custodian's unrecoverable ``auto_nbands`` case), or when the
+    ``2 NELECT`` (custodian's unrecoverable ``auto_nbands`` case; with
+    ``nbands_rounding="auto"`` the rounding step warns instead), or when the
     ranks do not split evenly into ``KPAR`` groups by ``NPAR`` (or ``NCORE``). DFPT
     (``LEPSILON``, ``LCALCEPS``, ``IBRION = 7, 8``), hybrid (``LHFCALC``),
     GW/BSE/ACFDT/RPA and nudged-elastic-band (``IMAGES``) runs, and a single
@@ -264,43 +316,54 @@ def plan_parallelization(
     count under the lattice's point group, counted up to ``ranks``) that still
     leaves every k-point group ``ceil(NIONS / 2)`` ranks (``LELF`` and
     ``LOPTICS`` force ``KPAR = 1``), and ``NCORE`` the divisor of the group
-    size (and of ``ranks_per_node`` when known) closest to 8 that keeps an explicit
-    ``NBANDS`` unchanged, or that keeps VASP's default band count either
-    unchanged by rounding or, rounded, at most ``2 NELECT``. VASP rounds its
-    default silently (custodian only refuses a changed INCAR ``NBANDS``), so the
-    second rule only keeps the default from being inflated. A planned value of
-    ``1`` is VASP's default and is not written.
+    size (and of ``ranks_per_node`` when known) closest to 8. With
+    ``nbands_rounding="auto"``, which the launch wrapper passes unless
+    ``vasp.nbands_rounding`` is ``off`` because it then rounds ``NBANDS``
+    itself, that candidate is taken whenever an explicit ``NBANDS``
+    rounded to its ``NPAR`` stays at most ``2 NELECT``; otherwise, and always
+    with ``"off"``, ``NCORE`` is the candidate closest to 8 that keeps an
+    explicit ``NBANDS`` unchanged. For VASP's default band count it is the
+    candidate that keeps that count either unchanged by rounding or, rounded, at
+    most ``2 NELECT``. VASP rounds its default silently (custodian only refuses a
+    changed INCAR ``NBANDS``), so that rule only keeps the default from being
+    inflated. In ``"auto"`` mode an ``NBANDS`` the wrapper wrote counts as the
+    base it was rounded from. A planned value of ``1`` is VASP's default and is
+    not written.
 
     :param directory: Read ``INCAR``, ``POSCAR``, ``POTCAR`` and ``KPOINTS`` from this directory.
     :param ranks: Plan for this many MPI ranks.
     :param ranks_per_node: Keep ``NCORE`` a divisor of this per-node rank count when known.
+    :param nbands_rounding: ``"auto"`` when ``NBANDS`` is rounded to ``NPAR`` after planning, ``"off"`` (the
+        default, for a caller that leaves ``NBANDS`` alone) when not.
     :return: The plan.
     :raises OSError: If a needed input file cannot be read.
-    :raises ValueError: If a needed input is malformed or ``ranks`` is not positive.
+    :raises ValueError: If a needed input is malformed, ``ranks`` is not positive, or
+        ``nbands_rounding`` is neither ``"auto"`` nor ``"off"``.
     """
 
     if ranks < 1:
         raise ValueError("ranks must be positive")
+    if nbands_rounding not in ("auto", "off"):
+        raise ValueError(f"nbands_rounding must be 'auto' or 'off', not {nbands_rounding!r}")
     root = Path(directory)
+    text = (root / "INCAR").read_text(encoding="utf-8")
     incar = read_incar(root / "INCAR")
+    if nbands_rounding == "auto":
+        requested = _requested_nbands(text, incar)
+    else:
+        requested = int(float(incar["NBANDS"])) if "NBANDS" in incar else None
     explicit = [tag for tag in ("NPAR", "NCORE", "KPAR") if tag in incar]
     if explicit:
         settings = " ".join(f"{tag}={incar[tag]}" for tag in explicit)
         warnings: list[str] = []
-        if "NBANDS" in incar:
-            nbands = int(float(incar["NBANDS"]))
-            header = read_poscar_header(root / "POSCAR")
-            nelect = _nelect(root, incar, header)
-            # VASP takes NPAR over NCORE when both are set.
-            if "NPAR" in incar:
-                npar = int(float(incar["NPAR"]))
-            else:
-                split = int(float(incar.get("KPAR", "1"))) * int(float(incar.get("NCORE", "1")))
-                npar = max(1, ranks // split)
-            rounded = _rounded(nbands, npar)
-            if rounded != nbands and rounded > 2 * nelect:
+        # With rounding on, the rounding step warns about this itself, except in a run it leaves to VASP.
+        if requested is not None and (nbands_rounding == "off" or _left_alone(incar, ranks) is not None):
+            nelect = _nelect(root, incar, read_poscar_header(root / "POSCAR"))
+            npar = _band_groups(incar, ranks)
+            rounded = _rounded(requested, npar)
+            if rounded != requested and rounded > 2 * nelect:
                 warnings.append(
-                    f"NBANDS={nbands} rounds up to {rounded} under NPAR={npar} from the explicit {settings}, above "
+                    f"NBANDS={requested} rounds up to {rounded} under NPAR={npar} from the explicit {settings}, above "
                     f"2 x NELECT = {2 * nelect:g}; custodian's VaspErrorHandler refuses that run as unrecoverable"
                 )
         kpar = int(float(incar.get("KPAR", "1")))
@@ -326,22 +389,25 @@ def plan_parallelization(
     kpar = max(item for item in _divisors(ranks) if item == 1 or (item <= n_k and ranks // item >= least))
     group = ranks // kpar
     candidates = [item for item in _divisors(group) if ranks_per_node is None or ranks_per_node % item == 0]
-    if "NBANDS" in incar:
-        nbands = int(float(incar["NBANDS"]))
+    nbands = _default_nbands(nelect, nions, incar) if requested is None else requested
+    start = max(item for item in candidates if item <= _PREFERRED_NCORE)
+
+    def fits(item: int) -> bool:
+        # An unchanged count cannot trip custodian's check, whatever 2 NELECT is.
+        rounded = _rounded(nbands, group // item)
+        return rounded == nbands or rounded <= 2 * nelect
+
+    if requested is not None:
         bands = f"NBANDS={nbands} explicit"
         order = [item for item in reversed(candidates) if item <= _PREFERRED_NCORE]
         order += [item for item in candidates if item > _PREFERRED_NCORE]
-        ncore = next((item for item in order if nbands % (group // item) == 0), group)
+        if nbands_rounding == "auto" and fits(start):
+            # The wrapper rounds NBANDS up to this NPAR afterwards, staying within 2 NELECT.
+            ncore = start
+        else:
+            ncore = next((item for item in order if nbands % (group // item) == 0), group)
     else:
-        nbands = _default_nbands(nelect, nions, incar)
         bands = f"default NBANDS~{nbands}"
-        start = max(item for item in candidates if item <= _PREFERRED_NCORE)
-
-        def fits(item: int) -> bool:
-            # An unchanged count cannot trip custodian's check, whatever 2 NELECT is.
-            rounded = _rounded(nbands, group // item)
-            return rounded == nbands or rounded <= 2 * nelect
-
         ncore = next((item for item in candidates if item >= start and fits(item)), group)
     return ParallelPlan(
         ranks,
@@ -349,4 +415,90 @@ def plan_parallelization(
         ncore if ncore > 1 else None,
         f"{ranks} ranks, KPAR={kpar} NCORE={ncore} ({bands}, NELECT={nelect:g}, NIONS={nions}, "
         f">={n_k} irreducible k-points from {source})",
+    )
+
+
+def _round_nbands(directory: str | os.PathLike[str], *, ranks: int) -> tuple[str | None, str, tuple[str, ...]]:
+    """Round the INCAR's ``NBANDS`` to its band-group count on ``ranks`` ranks, as the launch wrapper does.
+
+    ``NPAR`` is the INCAR's explicit ``NPAR``, else ``ranks / (KPAR NCORE)`` with
+    the INCAR's values (VASP's ``1`` when absent). An explicit ``NBANDS`` is
+    rounded up to a multiple of it, an absent one becomes VASP's default rounded
+    the same way, each only while the result stays at most ``2 NELECT``; a value
+    written carries the marker comment that :func:`_requested_nbands` reads back,
+    so a value written before is recomputed from its base. The cases
+    :func:`plan_parallelization` leaves to VASP, and ``NPAR = 1``, round nothing,
+    but still put a value written before back to its base. Bare marker lines are
+    removed.
+
+    :param directory: Read ``INCAR``, ``POSCAR`` and ``POTCAR`` from this directory.
+    :param ranks: Round for this many MPI ranks.
+    :return: The rewritten INCAR text, or ``None`` when it stays as it is; one line
+        explaining the decision; and warnings.
+    :raises OSError: If a needed input file cannot be read.
+    :raises ValueError: If a needed input is malformed.
+    """
+
+    root = Path(directory)
+    text = (root / "INCAR").read_text(encoding="utf-8")
+    incar = read_incar(root / "INCAR")
+    marker = _marker(text, incar)
+    requested = _requested_nbands(text, incar)
+    current = (int(float(incar["NBANDS"])) if "NBANDS" in incar else None, None if marker is None else marker[2])
+    warnings: tuple[str, ...] = ()
+    reason = _left_alone(incar, ranks)
+    if reason is not None:
+        # A value this wrapper wrote on an earlier launch goes back to what the INCAR asked for.
+        context, source = f"left to VASP: {reason}", "default" if requested is None else str(requested)
+        target: tuple[int | None, str | None] = (requested, None) if marker is not None else current
+    else:
+        npar = _band_groups(incar, ranks)
+        if "NPAR" in incar:
+            context = f"NPAR={npar} explicit"
+        else:
+            kpar, ncore = incar.get("KPAR", "1"), incar.get("NCORE", "1")
+            context = f"NPAR={npar} from {ranks} ranks / (KPAR={kpar} x NCORE={ncore})"
+        if npar <= 1 and marker is None:
+            if _BARE_MARKER.search(text) is None:
+                return None, f"{context}, nothing to round", ()
+            # Only stray marker lines to remove: nothing that needs the POSCAR or POTCAR.
+            target, source = current, ""
+        else:
+            header = read_poscar_header(root / "POSCAR")
+            nelect = _nelect(root, incar, header)
+            base = _default_nbands(nelect, sum(header.counts), incar) if requested is None else requested
+            source = f"default {base}" if requested is None else str(base)
+            rounded = _rounded(base, npar)
+            if rounded == base and requested is not None:
+                target = (base, None)
+            elif npar > 1 and rounded <= 2 * nelect:
+                target = (rounded, f"# httk: rounded from {source} for NPAR {npar}")
+            else:
+                target = (requested, None)
+                if rounded != base:
+                    limit = f"rounds up to {rounded} under {context}, above 2 x NELECT = {2 * nelect:g}"
+                    if requested is None:
+                        warnings = (
+                            f"VASP's default NBANDS {base} {limit}; not written, VASP rounds its default itself",
+                        )
+                    else:
+                        refusal = "custodian's VaspErrorHandler refuses that run as unrecoverable"
+                        advice = (
+                            f"not written: VASP rounds it itself and {refusal}; remove NBANDS to restore VASP's default"
+                        )
+                        warnings = (f"NBANDS={base} {limit}; {advice}",)
+    before = incar.get("NBANDS", "absent")
+    # Marker lines left bare (by an older INCAR rewrite, or by hand) describe nothing any more.
+    cleaned = _BARE_MARKER.sub("", text)
+    if target == current:
+        if cleaned == text:
+            return None, f"{context}, NBANDS {before} unchanged", warnings
+        return cleaned, f"{context}, stray marker line removed, NBANDS {before} unchanged", warnings
+    value, comment = target
+    written = None if value is None else f"{value}  {comment}" if comment else value
+    after = "absent (VASP's default)" if value is None else str(value)
+    return (
+        _updated_incar(cleaned, {"NBANDS": written}),
+        f"{context}, NBANDS {before} -> {after} (from {source})",
+        warnings,
     )

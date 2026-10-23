@@ -71,7 +71,8 @@ command starts through the launch wrapper {py:mod}`httk.codes.vasp.launch`
 ({doc}`details`), which selects the non-collinear (`vasp.ncl_command`) or
 Gamma-only (`vasp.gamma_command`) binary when the inputs need one and the
 setting is configured (otherwise the given command runs), writes
-planned `KPAR`/`NCORE` into the `INCAR` unless it sets them already, and applies
+planned `KPAR`/`NCORE` into the `INCAR` unless it sets them already, rounds
+`NBANDS` to the band-group count (`vasp.nbands_rounding = off` opts out), and applies
 the prefix itself; `dispatch=False` (`--no-dispatch`) runs the command directly
 behind the prefix, as before. The run report's `process.argv` is then the
 wrapper's command line, not the VASP program's, and the configured variant
@@ -87,7 +88,9 @@ states them in full):
   at `DEFAULT_KPOINT_CENTERING`, which is `Monkhorst-Pack`, because the remedy
   ladder promotes `Gamma` as the fix for two k-point failure classes.
 - **Explicit tags win.** `VaspPreparationOptions.incar_tags` is written before
-  anything is derived, and no derived value overwrites a tag the caller set.
+  anything is derived, and no derived value overwrites a tag the caller set. A
+  `None` (JSON `null`) value removes the tag and leaves it to VASP's own default,
+  as `update_incar({"TAG": None})` and `httk_vasp_unset_tag TAG` do.
 - **A rattle needs entropy.** {py:func}`~httk.codes.vasp.rattle_poscar` requires
   an explicit `seed` or an `entropy` string, normally attempt-derived, because two
   retries that rattle identically are two identical calculations.
@@ -117,7 +120,10 @@ step_prepare() {
 ```
 
 The `httk_vasp_*` functions correspond directly to the Python helpers: `prepare`,
-`prepare_kpoints`, `prepare_potcar`, `get_tag`, `set_tag` and `nbands`; `run`,
+`prepare_kpoints`, `prepare_potcar`, `get_tag`, `set_tag`, `unset_tag` (which
+removes a tag so VASP uses its default, and succeeds when it is absent) and
+`nbands` (which, like `calculate_nbands`, falls back to the five-per-atom
+`MAGMOM` estimate when the INCAR sets none); `run`,
 `diagnose` and `report_problems` (which prints the distinct non-warning diagnostic
 codes of a run report, one per line); `remedy_plan`, `remedy_apply` and
 `remedy_reapply` (which prints the replayed changes as JSON); `preclean`,

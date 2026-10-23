@@ -31,6 +31,7 @@ from httk.codes.vasp import (
     read_incar,
     reapply_vasp_remedies,
     register_remedy_policy,
+    remedies,
     remedy_policy,
     remedy_policy_names,
     run_vasp,
@@ -407,6 +408,57 @@ def test_explicit_incar_tags_win_over_every_derived_value(tmp_path: Path) -> Non
     assert tags["EDIFF"] == "1e-09"
     assert tags["MAGMOM"] == "2*1"
     assert tags["EDIFFG"]
+
+
+def test_null_incar_tags_leave_magmom_and_nbands_to_vasp(tmp_path: Path) -> None:
+    _poscar(tmp_path)
+    (tmp_path / "POTCAR").write_text("TITEL = PAW Si\n ZVAL = 4.000\n", encoding="utf-8")
+    (tmp_path / "INCAR").write_text("ISPIN = 2\nMAGMOM = 2*3\nNBANDS = 40 ; ISYM = 0\n", encoding="utf-8")
+
+    prepared = prepare_vasp_inputs(
+        VaspPreparationOptions(incar_tags={"MAGMOM": None, "NBANDS": None}), directory=tmp_path
+    )
+
+    tags = read_incar(tmp_path / "INCAR")
+    assert "MAGMOM" not in tags and "NBANDS" not in tags and tags["ISYM"] == "0"
+    assert prepared["incar_tags"] == {"MAGMOM": None, "NBANDS": None}
+
+
+def test_the_band_heuristic_reads_the_magmom_the_incar_ends_up_with(tmp_path: Path) -> None:
+    # Ten Si atoms: five per atom gives 25 + ceil(50 / 2) = 50 bands, VASP's one per atom 25 + 20 = 45, made even.
+    (tmp_path / "POSCAR").write_text(
+        "Si10\n1.0\n10 0 0\n0 10 0\n0 0 10\nSi\n10\nDirect\n" + "0 0 0\n" * 10, encoding="utf-8"
+    )
+    (tmp_path / "POTCAR").write_text("TITEL = PAW Si\n ZVAL = 4.000\n", encoding="utf-8")
+    for incar_tags, magmom, nbands in (({}, "10*5", "50"), ({"MAGMOM": None}, None, "46")):
+        (tmp_path / "INCAR").write_text("ISPIN = 2\n", encoding="utf-8")
+        prepare_vasp_inputs(VaspPreparationOptions(incar_tags=incar_tags), directory=tmp_path)
+        tags = read_incar(tmp_path / "INCAR")
+        assert (tags.get("MAGMOM"), tags["NBANDS"]) == (magmom, nbands)
+
+
+def test_a_remedy_with_a_none_value_removes_the_tag_and_replays_as_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Registered on a copy, so the policy listing other tests pin stays as it was.
+    monkeypatch.setattr(remedies, "_REMEDY_POLICIES", dict(remedies._REMEDY_POLICIES))
+    _poscar(tmp_path)
+    (tmp_path / "INCAR").write_text("ISYM = 2\nNBANDS = 30\n", encoding="utf-8")
+    history = tmp_path / "history.json"
+    register_remedy_policy("tests-unset", {"zpotrf": ((("incar.NBANDS", None),),)}, ("zpotrf",), replace=True)
+    decision = plan_vasp_remedy(
+        (Diagnostic("zpotrf", "fatal", "factorization failed", "stdout"),),
+        directory=tmp_path,
+        history_path=history,
+        policy="tests-unset",
+    )
+    assert decision.changes == (("incar.NBANDS", None),)
+    apply_vasp_remedy(decision, directory=tmp_path, history_path=history)
+    assert read_incar(tmp_path / "INCAR") == {"ISYM": "2"}
+
+    (tmp_path / "INCAR").write_text("NBANDS = 30\nISYM = 2\n", encoding="utf-8")
+    assert reapply_vasp_remedies(directory=tmp_path, history_path=history) == (("incar.NBANDS", None),)
+    assert (tmp_path / "INCAR").read_text(encoding="utf-8") == "ISYM = 2\n"
 
 
 def test_a_group_registers_its_own_policy_without_editing_the_module(tmp_path: Path) -> None:

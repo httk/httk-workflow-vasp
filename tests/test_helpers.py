@@ -95,3 +95,15 @@ def test_atomic_text_writes_keep_mode_and_crlf(tmp_path: Path) -> None:
     fresh = tmp_path / "new"
     _write_text_atomic(fresh, "a\n")
     assert fresh.read_bytes() == b"a\n"
+
+
+def test_a_none_value_removes_every_assignment_of_its_tag(tmp_path: Path) -> None:
+    incar = tmp_path / "INCAR"
+    incar.write_text("NBANDS = 24\nISPIN = 2 ; NBANDS = 30 ; ISYM = 0 # kept\nMAGMOM = 2*1 ! why\nENCUT = 520\n")
+    update_incar({"NBANDS": None, "magmom": None, "ALGO": None}, incar)
+    # Other statements and comments on a line survive; a line left empty disappears.
+    assert incar.read_text(encoding="utf-8") == "ISPIN = 2 ; ISYM = 0 # kept\n! why\nENCUT = 520\n"
+    # The launch wrapper's marker goes with the value it described, on any replaced line.
+    incar.write_text("NBANDS = 64  # httk: rounded from 61 for NPAR 8\nISYM = 0 # httk: rounded from 1 for NPAR 2\n")
+    update_incar({"NBANDS": 66, "ISYM": 2}, incar)
+    assert incar.read_text(encoding="utf-8") == "ISYM = 2\nNBANDS = 66\n"

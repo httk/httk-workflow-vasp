@@ -239,27 +239,37 @@ def update_incar(
     values: Mapping[str, object],
     path: str | os.PathLike[str] = "INCAR",
 ) -> Path:
-    """Atomically replace selected INCAR tags while preserving other lines.
+    """Atomically replace or remove selected INCAR tags while preserving other lines.
 
     VASP allows several ``;``-separated assignments per line, and
     :func:`read_incar` reads them all, so an update has to rewrite the individual
     statements of a line rather than drop or keep the whole line: updating
     ``ISYM`` in ``ISPIN = 2 ; ISYM = 2`` leaves ``ISPIN = 2`` and appends the new
-    ``ISYM``, instead of leaving a line that still assigns the old value. The
-    file keeps its mode, its line endings (CRLF stays CRLF) and a missing final
-    newline.
+    ``ISYM``, instead of leaving a line that still assigns the old value. A value
+    of ``None`` removes every assignment of its tag and writes none, which leaves
+    the tag at VASP's own default; this holds for every caller, including a remedy
+    policy's ``incar.<TAG>`` change. A line left without statements or comment
+    disappears, and so does the launch wrapper's ``# httk: rounded from ...``
+    marker of a replaced line, since it described the old value. The file keeps its mode, its line endings (CRLF stays CRLF) and a
+    missing final newline.
 
-    :param values: Replace these INCAR tag assignments.
+    :param values: Replace these INCAR tag assignments; a ``None`` value removes the tag.
     :param path: Update the INCAR file at this path.
     :return: The updated INCAR path.
     :raises ValueError: If a tag name is empty or invalid.
     """
 
     destination = Path(path)
-    normalized = {str(name).strip().upper(): str(value) for name, value in values.items()}
+    _write_text_atomic(destination, _updated_incar(destination.read_text(encoding="utf-8"), values))
+    return destination
+
+
+def _updated_incar(text: str, values: Mapping[str, object]) -> str:
+    """Return INCAR ``text`` with the tags of ``values`` replaced (removed for ``None``), as in :func:`update_incar`."""
+
+    normalized = {str(name).strip().upper(): None if value is None else str(value) for name, value in values.items()}
     if not normalized or any(not name or re.fullmatch(r"[A-Z][A-Z0-9_]*", name) is None for name in normalized):
         raise ValueError("INCAR updates require valid nonempty tag names")
-    text = destination.read_text(encoding="utf-8")
     kept: list[str] = []
     for line in text.splitlines():
         comment_match = re.search(r"[#!]", line)
@@ -272,15 +282,17 @@ def update_incar(
             continue
         surviving = [item.strip() for item in statements if _incar_statement_tag(item) not in normalized]
         remainder = " ; ".join(item for item in surviving if item)
+        if re.match(r"#[ \t]*httk: rounded from", comment):
+            # The launch wrapper's NBANDS marker describes the value replaced here, so it goes with it.
+            comment = ""
         if remainder and comment:
             kept.append(f"{remainder} {comment}")
         elif remainder or comment:
             kept.append(remainder or comment)
     # Appended in tag order: the same set of updates then always produces the same
     # file, whatever order the caller's mapping happened to have.
-    kept.extend(f"{name} = {value}" for name, value in sorted(normalized.items()))
-    _write_text_atomic(destination, "\n".join(kept) + ("\n" if text.endswith("\n") else ""))
-    return destination
+    kept.extend(f"{name} = {value}" for name, value in sorted(normalized.items()) if value is not None)
+    return "\n".join(kept) + ("\n" if text.endswith("\n") else "")
 
 
 def _read_potential(path: Path) -> bytes:
@@ -625,6 +637,7 @@ def calculate_nbands(
     potcar: str | os.PathLike[str] = "POTCAR",
     incar: str | os.PathLike[str] = "INCAR",
     divisor: int | None = None,
+    magmom: str | None = None,
 ) -> int:
     """Calculate a conservative VASP band count from input metadata.
 
@@ -643,6 +656,8 @@ def calculate_nbands(
     :param potcar: Read valence counts from this POTCAR.
     :param incar: Read spin and magnetization tags from this INCAR.
     :param divisor: Round the result up to a multiple of this positive divisor.
+    :param magmom: Use this ``MAGMOM`` for ``ISPIN = 2`` instead of the INCAR's, or, when the INCAR sets none,
+        instead of :func:`suggested_magnetic_moments`.
     :return: The conservative even band count.
     :raises ValueError: If the divisor or required input metadata is invalid.
     """
@@ -656,7 +671,9 @@ def calculate_nbands(
     natoms = max(6, sum(header.counts))
     candidates: tuple[int, ...]
     if ispin == 2:
-        magnetic = _expanded_sum(tags.get("MAGMOM", suggested_magnetic_moments(poscar)))
+        if magmom is None:
+            magmom = tags.get("MAGMOM", suggested_magnetic_moments(poscar))
+        magnetic = _expanded_sum(magmom)
         candidates = (
             math.floor(0.6 * electrons + 1) + math.ceil(natoms / 2),
             math.floor(0.6 * electrons + 1) + math.ceil(abs(magnetic) / 2),
@@ -742,7 +759,8 @@ class VaspPreparationOptions:
     :param parallel_tag: Set the selected parallel INCAR tag when set.
     :param parallel_value: Set the value for the selected parallel tag.
     :param normalize_handedness: Normalize a left-handed POSCAR before preparation.
-    :param incar_tags: Apply these explicit INCAR tags before derived defaults.
+    :param incar_tags: Apply these explicit INCAR tags before derived defaults; a ``None`` value removes the tag
+        and suppresses its derived default, leaving it to VASP.
     """
 
     kpoint_density: float = 20.0
@@ -766,7 +784,10 @@ def prepare_vasp_inputs(
     ``incar_tags`` is applied to the INCAR first and wins over everything derived
     afterwards: the derived values are defaults for what the caller did not say,
     so an explicit ``EDIFF``, ``MAGMOM``, or ``NBANDS`` survives preparation, and
-    an explicit ``ISPIN`` is what the band-count heuristic reads.
+    an explicit ``ISPIN`` is what the band-count heuristic reads. A ``None`` value
+    asks for VASP's own default: the tag is removed from the INCAR (the template's
+    assignment included) and nothing is derived for it. The band-count heuristic
+    reads the ``MAGMOM`` the INCAR ends up with, VASP's one per atom when it is removed.
 
     :param options: Use these preparation options, or their defaults when unset.
     :param directory: Prepare the VASP inputs in this directory.
@@ -806,11 +827,15 @@ def prepare_vasp_inputs(
         updates["EDIFF"] = max(options.accuracy_per_atom * atoms / options.ediff_margin, 1e-6)
         updates["EDIFFG"] = max(options.accuracy_per_atom * atoms, 1e-4)
     current = read_incar(incar)
-    if "MAGMOM" not in current:
+    if "MAGMOM" not in current and "MAGMOM" not in explicit:
         updates["MAGMOM"] = suggested_magnetic_moments(poscar)
-    if "NBANDS" not in current and (root / "POTCAR").is_file():
+    if "NBANDS" not in current and "NBANDS" not in explicit and (root / "POTCAR").is_file():
         divisor = options.parallel_value if options.parallel_tag == "NPAR" else None
-        updates["NBANDS"] = calculate_nbands(poscar=poscar, potcar=root / "POTCAR", incar=incar, divisor=divisor)
+        # The MAGMOM VASP will read: the one derived here, the INCAR's own, else VASP's default of 1 per ion.
+        magmom = str(updates.get("MAGMOM", current.get("MAGMOM", f"{sum(header.counts)}*1")))
+        updates["NBANDS"] = calculate_nbands(
+            poscar=poscar, potcar=root / "POTCAR", incar=incar, divisor=divisor, magmom=magmom
+        )
     if options.parallel_tag is not None:
         if options.parallel_tag not in {"NPAR", "NCORE", "KPAR"}:
             raise ValueError("parallel_tag must be NPAR, NCORE, or KPAR")

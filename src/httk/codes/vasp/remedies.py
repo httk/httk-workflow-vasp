@@ -159,7 +159,7 @@ class RemedyPolicy:
 _REMEDY_POLICIES: dict[str, RemedyPolicy] = {}
 
 #: Every remedy operation :func:`apply_vasp_remedy` implements, besides the
-#: ``incar.<TAG>`` form that assigns one INCAR tag.
+#: ``incar.<TAG>`` form that assigns one INCAR tag (or removes it, for ``None``).
 REMEDY_OPERATIONS = (
     "bump_bands",
     "bump_kpoints",

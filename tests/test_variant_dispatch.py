@@ -154,7 +154,7 @@ def test_wrapper_plans_once_and_execs_prefix_then_binary(tmp_path: Path) -> None
     records = [json.loads(line) for line in (tmp_path / "exec.log").read_text(encoding="utf-8").splitlines()]
     expected = [["fake-srun", "-n", "32", "vasp_std", str(calculation)], ["vasp_std", str(calculation)]]
     assert records == expected * 2
-    assert len((calculation / "httk-vasp-launch.log").read_text(encoding="utf-8").splitlines()) == 2
+    assert (calculation / "httk-vasp-launch.log").read_text(encoding="utf-8").count(" parallel: ") == 2
 
 
 def test_wrapper_parallel_off_and_ranks_override(tmp_path: Path) -> None:
@@ -168,7 +168,7 @@ def test_wrapper_parallel_off_and_ranks_override(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "4 ranks" in result.stderr and "ranks from --ranks" in result.stderr
     assert "KPAR = 4" in (calculation / "INCAR").read_text(encoding="utf-8")
-    assert len((calculation / "httk-vasp-launch.log").read_text(encoding="utf-8").splitlines()) == 3
+    assert (calculation / "httk-vasp-launch.log").read_text(encoding="utf-8").count(" parallel: ") == 3
 
 
 def test_wrapper_refuses_an_unknown_parallelization_setting(tmp_path: Path) -> None:

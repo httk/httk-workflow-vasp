@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Native httk VASP Bash API, version 3. Source httk-workflow.sh first.
+# Native httk VASP Bash API, version 4. Source httk-workflow.sh first.
 #
 # Every function is one bridge subcommand, and every option of that subcommand is
 # available here: the arguments are passed through untouched. Version 2 keeps that
@@ -22,7 +22,11 @@
 #
 # Version 3 adds httk_vasp_remedy_reapply and httk_vasp_report_problems (the
 # distinct non-warning diagnostic codes of a run report, one per line).
-HTTK_VASP_BASH_API_VERSION=3
+#
+# Version 4 adds httk_vasp_unset_tag TAG [path=INCAR], which removes every
+# assignment of TAG so VASP uses its own default; an absent TAG is no error and
+# leaves the file untouched. httk_vasp_set_tag TAG null still writes "null".
+HTTK_VASP_BASH_API_VERSION=4
 
 _httk_vasp_require_workflow_api() {
     if ! declare -F _httk_workflow_bridge >/dev/null 2>&1; then
@@ -44,6 +48,11 @@ httk_vasp_get_tag() {
 httk_vasp_set_tag() {
     _httk_vasp_require_workflow_api || return
     _httk_workflow_bridge vasp-set-tag "$@"
+}
+
+httk_vasp_unset_tag() {
+    _httk_vasp_require_workflow_api || return
+    _httk_workflow_bridge vasp-unset-tag "$@"
 }
 
 httk_vasp_prepare_kpoints() {

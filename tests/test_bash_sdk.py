@@ -26,6 +26,8 @@ httk_workflow_runner tests.bash.vasp start
 step_start() {
     printf 'ENCUT = 520\\n' >INCAR
     httk_workflow_state_set encut "$(httk_vasp_get_tag ENCUT)"
+    httk_vasp_unset_tag ENCUT
+    httk_workflow_state_set unset "$(httk_vasp_get_tag ENCUT || printf '"absent"')"
     httk_workflow_succeed
 }
 
@@ -49,7 +51,10 @@ def test_a_managed_bash_runner_sources_the_vasp_api_and_calls_a_vasp_verb(tmp_pa
     [record] = job_records(workspace, states=("succeeded", "failed"))
     assert (record.job_id, record.state) == (job.job_id, "succeeded"), record.failure
     root = record.workspace_root / record.payload_path
-    assert json.loads((root / ".httk-job" / "state.json").read_text(encoding="utf-8")) == {"encut": 520}
+    assert json.loads((root / ".httk-job" / "state.json").read_text(encoding="utf-8")) == {
+        "encut": 520,
+        "unset": "absent",
+    }
 
 
 def _bridge(cwd: Path, *arguments: str, stdin: str | None = None) -> "subprocess.CompletedProcess[str]":
@@ -111,3 +116,21 @@ def test_the_report_problems_bridge_command_lists_distinct_non_warning_codes(tmp
 
     assert (result.returncode, result.stdout) == (0, "ionic_nonconvergence\nzpotrf\n"), result.stderr
     assert _bridge(tmp_path, "vasp-report-problems", "missing.json").returncode == 2
+
+
+def test_the_unset_tag_bridge_command_removes_a_tag_and_skips_an_absent_one(tmp_path: Path) -> None:
+    incar = tmp_path / "INCAR"
+    incar.write_text("ISPIN = 2 ; MAGMOM = 2*1\nNBANDS = 24\n", encoding="utf-8")
+
+    for tag in ("magmom", "NBANDS"):
+        result = _bridge(tmp_path, "vasp-unset-tag", tag)
+        assert result.returncode == 0, result.stderr
+    assert incar.read_text(encoding="utf-8") == "ISPIN = 2\n"
+
+    before = incar.stat().st_mtime_ns, incar.stat().st_ino
+    result = _bridge(tmp_path, "vasp-unset-tag", "NBANDS", "INCAR")
+    assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+    assert (incar.stat().st_mtime_ns, incar.stat().st_ino) == before
+    # set-tag keeps writing what it is given; unset is the Bash route to VASP's default.
+    assert _bridge(tmp_path, "vasp-set-tag", "MAGMOM", "null").returncode == 0
+    assert incar.read_text(encoding="utf-8") == "ISPIN = 2\nMAGMOM = null\n"

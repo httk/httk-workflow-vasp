@@ -8,7 +8,9 @@ over k-points and bands, is only known once its ``INCAR``, ``POSCAR``,
 runs this module once per launch, in front of the attempt's launch prefix: it
 selects the binary, writes the ``KPAR``/``NCORE`` that
 :func:`httk.codes.vasp.parallel.plan_parallelization` plans into the INCAR
-unless the INCAR already sets them, records the decision on stderr and in
+unless the INCAR already sets them, rounds ``NBANDS`` to the resulting
+band-group count (an absent one to VASP's default, made explicit) unless
+``vasp.nbands_rounding`` is ``off``, records each decision on stderr and in
 ``httk-vasp-launch.log``, and execs the launch prefix (``HTTK_WORKFLOW_LAUNCH``)
 followed by the selected binary. It never runs per rank, so the INCAR is
 rewritten by exactly one process before any rank reads it; pymatgen is never
@@ -26,8 +28,8 @@ from pathlib import Path
 
 from httk.workflow.codes import launch_command, utc_now
 
-from .inputs import _true, read_incar, update_incar
-from .parallel import plan_parallelization
+from .inputs import _true, _write_text_atomic, read_incar, update_incar
+from .parallel import _round_nbands, plan_parallelization
 
 __all__ = ["main", "select_vasp_command"]
 
@@ -235,29 +237,55 @@ def _attempt_ranks(
 
 
 def _parallel_lines(
-    root: Path, mode: str, ranks_option: int | None, prefix: Sequence[str], command: Sequence[str]
+    root: Path, mode: str, rounding: str, ranks_option: int | None, prefix: Sequence[str], command: Sequence[str]
 ) -> list[str]:
-    """Plan and apply the parallelization tags, returning the decision and warning lines."""
+    """Plan and apply the parallelization tags, then round NBANDS, returning the decision and warning lines."""
 
-    if mode == "off":
-        return ["parallel: off (vasp.parallelization); INCAR unchanged"]
     ranks, per_node, source = (
         (ranks_option, None, "--ranks") if ranks_option is not None else _attempt_ranks(prefix, command, _context())
     )
-    if ranks is None:
-        return [f"parallel: rank count unknown ({source}); INCAR unchanged"]
-    try:
-        plan = plan_parallelization(root, ranks=ranks, ranks_per_node=per_node)
-        tags = {name: value for name, value in (("KPAR", plan.kpar), ("NCORE", plan.ncore)) if value is not None}
-        if tags:
-            update_incar(tags, root / "INCAR")
-    except (OSError, ValueError) as error:
-        return [f"parallel: not planned ({error}); INCAR unchanged"]
-    written = " ".join(f"{name}={value}" for name, value in tags.items())
-    return [
-        f"parallel: {plan.reason}, ranks from {source}; " + (f"wrote {written}" if tags else "INCAR unchanged"),
-        *(f"warning: {item}" for item in plan.warnings),
-    ]
+    lines: list[str] = []
+    if mode == "off":
+        lines.append("parallel: off (vasp.parallelization); INCAR unchanged")
+    elif ranks is None:
+        lines.append(f"parallel: rank count unknown ({source}); INCAR unchanged")
+    else:
+        try:
+            plan = plan_parallelization(root, ranks=ranks, ranks_per_node=per_node, nbands_rounding=rounding)
+            tags = {name: value for name, value in (("KPAR", plan.kpar), ("NCORE", plan.ncore)) if value is not None}
+            if tags:
+                update_incar(tags, root / "INCAR")
+            written = " ".join(f"{name}={value}" for name, value in tags.items())
+            lines.append(
+                f"parallel: {plan.reason}, ranks from {source}; " + (f"wrote {written}" if tags else "INCAR unchanged")
+            )
+            lines.extend(f"warning: {item}" for item in plan.warnings)
+        except (OSError, ValueError) as error:
+            lines.append(f"parallel: not planned ({error}); INCAR unchanged")
+    if rounding == "off":
+        lines.append("nbands: off (vasp.nbands_rounding); NBANDS unchanged")
+    elif ranks is None:
+        lines.append(f"nbands: rank count unknown ({source}); NBANDS unchanged")
+    else:
+        try:
+            text, reason, warnings = _round_nbands(root, ranks=ranks)
+            if text is not None:
+                _write_text_atomic(root / "INCAR", text)
+            lines.append(f"nbands: {ranks} ranks from {source}, {reason}")
+            lines.extend(f"warning: {item}" for item in warnings)
+        except (OSError, ValueError) as error:
+            lines.append(f"nbands: not rounded ({error}); NBANDS unchanged")
+    return lines
+
+
+def _mode(option: str | None, name: str) -> str:
+    """Resolve an ``auto``/``off`` setting: the command-line option, else :func:`_setting`, else ``auto``."""
+
+    value = option or _setting(name)
+    mode = "auto" if value is None else value
+    if mode not in ("auto", "off"):
+        raise ValueError(f"{name} must be 'auto' or 'off', not {mode!r}")
+    return str(mode)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -271,7 +299,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m httk.codes.vasp.launch",
         description="Exec the standard, non-collinear or Gamma-only VASP command the inputs need, behind the "
-        "attempt's launch prefix, after writing planned KPAR/NCORE into the INCAR.",
+        "attempt's launch prefix, after writing planned KPAR/NCORE and a rounded NBANDS into the INCAR.",
     )
     parser.add_argument("--standard", required=True, type=_command, help="standard VASP command (shlex string)")
     parser.add_argument("--ncl", type=_command, help="non-collinear VASP command (shlex string)")
@@ -287,21 +315,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="plan KPAR/NCORE (auto) or leave the INCAR alone (off); default: the vasp.parallelization setting, "
         "else auto",
     )
+    parser.add_argument(
+        "--nbands-rounding",
+        choices=("auto", "off"),
+        help="round NBANDS to the band-group count (auto) or leave it alone (off); default: the "
+        "vasp.nbands_rounding setting, else auto",
+    )
     parser.add_argument("--ranks", type=_positive, help="plan for this many MPI ranks instead of the attempt's")
     parser.add_argument("--no-launch", action="store_true", help="exec the command without the launch prefix")
     arguments = parser.parse_args(argv)
     try:
         variant, command = _select(arguments.directory, arguments.standard, arguments.ncl, arguments.gamma)
         launched = launch_command(command, launch=not arguments.no_launch)
-        value = arguments.parallel or _setting("vasp.parallelization")
-        mode = "auto" if value is None else value
-        if mode not in ("auto", "off"):
-            raise ValueError(f"vasp.parallelization must be 'auto' or 'off', not {mode!r}")
+        mode = _mode(arguments.parallel, "vasp.parallelization")
+        rounding = _mode(arguments.nbands_rounding, "vasp.nbands_rounding")
     except (OSError, ValueError) as error:
         print(f"httk.codes.vasp.launch: {error}", file=sys.stderr)
         return 2
     root = Path(arguments.directory)
-    lines = _parallel_lines(root, str(mode), arguments.ranks, launched[: len(launched) - len(command)], command)
+    lines = _parallel_lines(root, mode, rounding, arguments.ranks, launched[: len(launched) - len(command)], command)
     try:
         with (root / "httk-vasp-launch.log").open("a", encoding="utf-8") as log:
             log.writelines(f"{utc_now()} {line}\n" for line in lines)

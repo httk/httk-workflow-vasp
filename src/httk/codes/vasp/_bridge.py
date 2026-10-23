@@ -75,6 +75,9 @@ def add_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]"
     vasp_set.add_argument("tag")
     vasp_set.add_argument("value")
     vasp_set.add_argument("path", nargs="?", default="INCAR")
+    vasp_unset = commands.add_parser("vasp-unset-tag")
+    vasp_unset.add_argument("tag")
+    vasp_unset.add_argument("path", nargs="?", default="INCAR")
     grid = commands.add_parser("vasp-kpoints")
     grid.add_argument("density", type=float)
     grid.add_argument("--poscar", default="POSCAR")
@@ -215,6 +218,10 @@ def run_command(arguments: argparse.Namespace) -> int:
         print(value)
     elif command == "vasp-set-tag":
         update_incar({arguments.tag: arguments.value}, arguments.path)
+    elif command == "vasp-unset-tag":
+        # Idempotent: an absent tag leaves the file untouched rather than rewritten.
+        if arguments.tag.strip().upper() in read_incar(arguments.path):
+            update_incar({arguments.tag: None}, arguments.path)
     elif command == "vasp-kpoints":
         grid = automatic_kpoint_grid(
             arguments.density, poscar=arguments.poscar, equal=arguments.equal, bump=arguments.bump

@@ -1,13 +1,15 @@
-"""The KPAR/NCORE planner and the launch wrapper's rank-count sources."""
+"""The KPAR/NCORE planner, the launch wrapper's NBANDS rounding, and its rank-count sources."""
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from httk.codes.vasp import VaspRemedyDecision, apply_vasp_remedy
 from httk.codes.vasp.inputs import read_incar, read_poscar_header
-from httk.codes.vasp.launch import _attempt_ranks, _setting
+from httk.codes.vasp.launch import _attempt_ranks, _parallel_lines, _setting, main
 from httk.codes.vasp.parallel import _default_nbands, _kpoint_bound, plan_parallelization
 
 DIAMOND = "diamond\n1.0\n0 1.78 1.78\n1.78 0 1.78\n1.78 1.78 0\nC\n2\nDirect\n0 0 0\n0.25 0.25 0.25\n"
@@ -124,6 +126,15 @@ def test_explicit_nbands_without_a_k_point_split_keeps_its_count(tmp_path: Path)
     # A single k-point: 39 bands cannot be split evenly, so NPAR = 1 keeps them.
     plan = plan_parallelization(_write(tmp_path, "NBANDS = 39\n", _mesh("1 1 1")), ranks=32, ranks_per_node=32)
     assert (plan.kpar, plan.ncore) == (None, 32)
+
+
+def test_auto_rounding_lets_ncore_follow_its_preference_within_2_nelect(tmp_path: Path) -> None:
+    # 39 bands on 32 ranks: NCORE = 8 means NPAR = 4 and 40 bands, within 2 x NELECT = 200 but not 16.
+    root = _write(tmp_path, "NELECT = 100\nNBANDS = 39\n", _mesh("1 1 1"))
+    assert plan_parallelization(root, ranks=32, ranks_per_node=32, nbands_rounding="auto").ncore == 8
+    assert plan_parallelization(root, ranks=32, ranks_per_node=32).ncore == 32
+    with pytest.raises(ValueError, match="nbands_rounding must be"):
+        plan_parallelization(root, ranks=32, nbands_rounding="on")
 
 
 def test_incar_nelect_overrides_the_potcar(tmp_path: Path) -> None:
@@ -273,3 +284,201 @@ def test_settings_resolve_parameter_then_variable_then_workspace(
     monkeypatch.setenv("HTTK_WORKFLOW_JOB_DIR", str(tmp_path))
     assert _setting("vasp.parallelization") == "off"
     assert _setting("vasp.ncl_command") is None
+
+
+# Diamond with NELECT = 100 on one k-point: VASP's default is max(51 + 3, 60) = 60 bands, 2 x NELECT = 200.
+RICH = "NELECT = 100\n"
+
+
+def _round(root: Path, ranks: int, mode: str = "auto", rounding: str = "auto") -> list[str]:
+    return _parallel_lines(root, mode, rounding, ranks, [], [])
+
+
+def _nbands_lines(root: Path) -> list[str]:
+    return [line for line in (root / "INCAR").read_text(encoding="utf-8").splitlines() if "NBANDS" in line]
+
+
+def test_an_absent_nbands_becomes_the_rounded_default_and_follows_the_ranks(tmp_path: Path) -> None:
+    root = _write(tmp_path, RICH, _mesh("1 1 1"))
+    lines = _round(root, 64)
+    assert _nbands_lines(root) == ["NBANDS = 64  # httk: rounded from default 60 for NPAR 8"]
+    assert "nbands: 64 ranks from --ranks, NPAR=8 from 64 ranks / (KPAR=1 x NCORE=8)" in lines[1]
+    assert "NBANDS absent -> 64 (from default 60)" in lines[1]
+
+    # Same ranks: nothing rewritten. NCORE = 8 is explicit now, so fewer ranks mean fewer band groups.
+    text = (root / "INCAR").read_text(encoding="utf-8")
+    assert "NBANDS 64 unchanged" in _round(root, 64)[1]
+    assert (root / "INCAR").read_text(encoding="utf-8") == text
+    _round(root, 32)
+    assert _nbands_lines(root) == ["NBANDS = 60  # httk: rounded from default 60 for NPAR 4"]
+    _round(root, 128)
+    assert _nbands_lines(root) == ["NBANDS = 64  # httk: rounded from default 60 for NPAR 16"]
+    assert "httk:" not in (root / "INCAR").read_text(encoding="utf-8").replace(_nbands_lines(root)[0], "")
+
+
+def test_an_explicit_nbands_is_rounded_only_when_needed_and_shrinks_back(tmp_path: Path) -> None:
+    root = _write(tmp_path, RICH + "NCORE = 8\nNBANDS = 61\n", _mesh("1 1 1"))
+    _round(root, 64)
+    assert _nbands_lines(root) == ["NBANDS = 64  # httk: rounded from 61 for NPAR 8"]
+    _round(root, 16)
+    assert _nbands_lines(root) == ["NBANDS = 62  # httk: rounded from 61 for NPAR 2"]
+    # One band group: a marked value goes back to its base, a marked default to absent.
+    _round(root, 8)
+    assert _nbands_lines(root) == ["NBANDS = 61"]
+    marked = _write(tmp_path, RICH + "NCORE = 8\nNBANDS = 64  # httk: rounded from default 60 for NPAR 8\n")
+    _round(marked, 8)
+    assert (marked / "INCAR").read_text(encoding="utf-8") == RICH + "NCORE = 8\n"
+
+    divisible = _write(tmp_path, RICH + "NCORE = 8\nNBANDS = 64\n", _mesh("1 1 1"))
+    text = (divisible / "INCAR").read_text(encoding="utf-8")
+    assert "NBANDS 64 unchanged" in _round(divisible, 64)[1]
+    assert (divisible / "INCAR").read_text(encoding="utf-8") == text
+
+
+def test_an_edited_marked_value_is_explicit(tmp_path: Path) -> None:
+    root = _write(
+        tmp_path, RICH + "NCORE = 8\nNBANDS = 66  # httk: rounded from default 60 for NPAR 8\n", _mesh("1 1 1")
+    )
+    _round(root, 64)
+    assert _nbands_lines(root) == ["NBANDS = 72  # httk: rounded from 66 for NPAR 8"]
+
+
+def test_explicit_npar_sets_the_band_groups(tmp_path: Path) -> None:
+    root = _write(tmp_path, RICH + "NPAR = 4\nNBANDS = 61\n", _mesh("1 1 1"))
+    lines = _round(root, 64)
+    assert "INCAR sets NPAR=4" in lines[0] and "NPAR=4 explicit" in lines[1]
+    assert _nbands_lines(root) == ["NBANDS = 64  # httk: rounded from 61 for NPAR 4"]
+
+
+@pytest.mark.parametrize("tag", ["LHFCALC = .TRUE.", "IBRION = 7", "ALGO = GW0", "IMAGES = 3", "LEPSILON = T"])
+def test_runs_left_to_vasp_keep_their_nbands_even_with_explicit_tags(tmp_path: Path, tag: str) -> None:
+    for incar in (f"{RICH}{tag}\nNCORE = 4\nNBANDS = 61\n", f"{RICH}{tag}\n"):
+        root = _write(tmp_path, incar, _mesh("1 1 1"))
+        lines = _round(root, 64)
+        assert "nbands: 64 ranks from --ranks, left to VASP" in lines[-1]
+        assert (root / "INCAR").read_text(encoding="utf-8") == incar
+
+
+def test_rounding_above_2_nelect_warns_and_writes_nothing(tmp_path: Path) -> None:
+    # Diamond, NELECT = 8: 8 default bands, or 9 explicit, rounded to NPAR = 32 exceed 16.
+    for incar, what in (("ENCUT = 520\n", "VASP's default NBANDS 8"), ("NBANDS = 9\n", "NBANDS=9")):
+        root = _write(tmp_path, incar, _mesh("1 1 1"))
+        lines = _round(root, 32, mode="off")
+        assert (root / "INCAR").read_text(encoding="utf-8") == incar
+        assert lines[-1].startswith(f"warning: {what} rounds up to 32 under NPAR=32") and "16" in lines[-1]
+    # A marked value that now rounds too far goes back to what it was rounded from.
+    root = _write(tmp_path, "NBANDS = 10  # httk: rounded from 9 for NPAR 2\n", _mesh("1 1 1"))
+    _round(root, 32, mode="off")
+    assert (root / "INCAR").read_text(encoding="utf-8") == "NBANDS = 9\n"
+    root = _write(tmp_path, "NBANDS = 8  # httk: rounded from default 8 for NPAR 2\n", _mesh("1 1 1"))
+    _round(root, 32, mode="off")
+    assert (root / "INCAR").read_text(encoding="utf-8") == "\n"
+
+
+def test_one_warning_when_explicit_tags_round_nbands_above_2_nelect(tmp_path: Path) -> None:
+    # The planner's warning stays for a caller without rounding; with rounding the rounding step warns alone.
+    root = _write(tmp_path, "NPAR = 32\nNBANDS = 39\n")
+    lines = _round(root, 32)
+    warnings = [line for line in lines if line.startswith("warning:")]
+    assert len(warnings) == 1 and "remove NBANDS to restore VASP's default" in warnings[0]
+    assert len(plan_parallelization(root, ranks=32).warnings) == 1
+
+
+def test_a_run_left_to_vasp_keeps_the_planners_2_nelect_warning(tmp_path: Path) -> None:
+    # The rounding step leaves this run alone, so the planner's warning is the one left.
+    root = _write(tmp_path, "LHFCALC = .TRUE.\nNCORE = 1\nNBANDS = 9\n")
+    lines = _round(root, 32)
+    warnings = [line for line in lines if line.startswith("warning:")]
+    assert len(warnings) == 1 and "NBANDS=9 rounds up to 32" in warnings[0] and "custodian" in warnings[0]
+
+
+def test_a_stray_marker_line_is_removed_without_reading_the_potcar(tmp_path: Path) -> None:
+    root = _write(tmp_path, "NCORE = 8\n# httk: rounded from 61 for NPAR 8\nNBANDS = 64\n")
+    (root / "POTCAR").unlink()
+    assert _round(root, 8, mode="off")[1].endswith("stray marker line removed, NBANDS 64 unchanged")
+    assert (root / "INCAR").read_text(encoding="utf-8") == "NCORE = 8\nNBANDS = 64\n"
+
+
+def test_band_groups_divide_out_explicit_and_planned_kpar(tmp_path: Path) -> None:
+    root = _write(tmp_path, RICH + "KPAR = 2 ; NCORE = 4\n", _mesh("1 1 1"))
+    assert "NPAR=8 from 64 ranks / (KPAR=2 x NCORE=4)" in _round(root, 64)[1]
+    expected = RICH + "KPAR = 2 ; NCORE = 4\nNBANDS = 64  # httk: rounded from default 60 for NPAR 8\n"
+    assert (root / "INCAR").read_text(encoding="utf-8") == expected
+    # Diamond 4x4x4 has 8 irreducible k-points: KPAR = 8 on 128 ranks, NCORE = 8, so NPAR = 2.
+    root = _write(tmp_path, RICH + "NBANDS = 61\n", _mesh("4 4 4"))
+    lines = _round(root, 128)
+    assert "KPAR=8 NCORE=8" in lines[0] and "NPAR=2 from 128 ranks" in lines[1]
+    expected = RICH + "KPAR = 8\nNCORE = 8\nNBANDS = 62  # httk: rounded from 61 for NPAR 2\n"
+    assert (root / "INCAR").read_text(encoding="utf-8") == expected
+
+
+@pytest.mark.parametrize(("tag", "ranks"), [("", 1), ("IBRION = 8\n", 64)])
+def test_a_run_left_to_vasp_gets_back_what_its_incar_asked_for(tmp_path: Path, tag: str, ranks: int) -> None:
+    for marked, restored in (
+        ("NBANDS = 64  # httk: rounded from 61 for NPAR 8\n", "NBANDS = 61\n"),
+        ("NBANDS = 64  # httk: rounded from default 60 for NPAR 8\n", ""),
+    ):
+        root = _write(tmp_path, RICH + tag + "NCORE = 8\n" + marked, _mesh("1 1 1"))
+        lines = _round(root, ranks)
+        assert "left to VASP" in lines[-1] and "NBANDS 64 -> " in lines[-1]
+        assert (root / "INCAR").read_text(encoding="utf-8") == RICH + tag + "NCORE = 8\n" + restored
+
+
+def test_a_remedy_on_a_marked_nbands_leaves_one_line_and_no_stray_marker(tmp_path: Path) -> None:
+    root = _write(tmp_path, RICH + "NCORE = 8\n", _mesh("1 1 1"))
+    _round(root, 64)
+    apply_vasp_remedy(
+        VaspRemedyDecision("reviewed-v1", "too_few_bands", 0, (("bump_bands", 2),), False, ""), directory=root
+    )
+    assert (root / "INCAR").read_text(encoding="utf-8") == RICH + "NCORE = 8\nNBANDS = 66\n"
+    _round(root, 64)
+    assert (root / "INCAR").read_text(
+        encoding="utf-8"
+    ) == RICH + "NCORE = 8\nNBANDS = 72  # httk: rounded from 66 for NPAR 8\n"
+    # A marker left on a line of its own is dropped on the next launch.
+    (root / "INCAR").write_text(RICH + "# httk: rounded from 61 for NPAR 8\nNCORE = 8\nNBANDS = 64\n", encoding="utf-8")
+    _round(root, 64)
+    assert (root / "INCAR").read_text(encoding="utf-8") == RICH + "NCORE = 8\nNBANDS = 64\n"
+
+
+def test_rounding_works_with_parallelization_off_and_can_be_switched_off(tmp_path: Path) -> None:
+    root = _write(tmp_path, RICH, _mesh("1 1 1"))
+    lines = _round(root, 64, mode="off")
+    assert lines[0] == "parallel: off (vasp.parallelization); INCAR unchanged"
+    assert _nbands_lines(root) == ["NBANDS = 64  # httk: rounded from default 60 for NPAR 64"]
+    root = _write(tmp_path, RICH, _mesh("1 1 1"))
+    assert _round(root, 64, mode="off", rounding="off")[1] == "nbands: off (vasp.nbands_rounding); NBANDS unchanged"
+    assert (root / "INCAR").read_text(encoding="utf-8") == RICH
+    assert _parallel_lines(root, "auto", "auto", None, [], [])[1].startswith("nbands: rank count unknown")
+
+
+def _main(root: Path, monkeypatch: pytest.MonkeyPatch, *arguments: str) -> int | None:
+    monkeypatch.setattr(os, "execvp", lambda *_: None)
+    (root / "INCAR").write_text(RICH, encoding="utf-8")
+    argv = ["--standard", "vasp_std", "--directory", str(root), "--ranks", "64", "--no-launch", "--parallel", "off"]
+    return main([*argv, *arguments])
+
+
+def test_nbands_rounding_resolves_option_then_parameter_then_variable_then_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _write(tmp_path, RICH, _mesh("1 1 1"))
+    _main(root, monkeypatch)
+    assert _nbands_lines(root)
+    monkeypatch.setenv("HTTK_WORKFLOW_CONTEXT", json.dumps({"settings": {"vasp.nbands_rounding": "off"}}))
+    _main(root, monkeypatch)
+    assert not _nbands_lines(root)
+    _main(root, monkeypatch, "--nbands-rounding", "auto")
+    assert _nbands_lines(root)
+    monkeypatch.setenv("HTTK_VASP_NBANDS_ROUNDING", "auto")
+    _main(root, monkeypatch)
+    assert _nbands_lines(root)
+    (tmp_path / "job.json").write_text(json.dumps({"parameters": {"vasp.nbands_rounding": "off"}}), encoding="utf-8")
+    monkeypatch.setenv("HTTK_WORKFLOW_JOB_DIR", str(tmp_path))
+    _main(root, monkeypatch)
+    assert not _nbands_lines(root)
+    assert "nbands: off (vasp.nbands_rounding)" in (root / "httk-vasp-launch.log").read_text(encoding="utf-8")
+    capsys.readouterr()
+    (tmp_path / "job.json").write_text(json.dumps({"parameters": {"vasp.nbands_rounding": True}}), encoding="utf-8")
+    assert _main(root, monkeypatch) == 2
+    assert "vasp.nbands_rounding must be 'auto' or 'off'" in capsys.readouterr().err

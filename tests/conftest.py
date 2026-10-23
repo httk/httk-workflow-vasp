@@ -23,6 +23,7 @@ def _isolated_httk_config(tmp_path_factory: pytest.TempPathFactory, monkeypatch:
         "HTTK_WORKFLOW_CONTEXT",
         "HTTK_WORKFLOW_JOB_DIR",
         "HTTK_VASP_PARALLELIZATION",
+        "HTTK_VASP_NBANDS_ROUNDING",
         "HTTK_VASP_NCL_COMMAND",
         "HTTK_VASP_GAMMA_COMMAND",
     ):
