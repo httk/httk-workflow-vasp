@@ -237,13 +237,14 @@ ONE_NODE = {"binding": {"nodes": [{"host": "a", "procs": 32, "gpus": 0}]}}
         (["mpirun", "-np", "8"], ["vasp_std"], ONE_NODE, (8, None)),
         (["mpirun", "-c", "4"], ["vasp_std"], {}, (4, None)),
         (["srun", "--ntasks-per-node", "8"], ["vasp_std"], TWO_NODES, (16, 8)),
-        # OpenMP threads, a per-node count without nodes, a thread flag alone, or GPUs: nothing planned.
+        # GPUs do not hide the rank count.
+        (SRUN, ["vasp_std"], {"binding": {"nodes": [{"host": "a", "procs": 8, "gpus": 1}]}}, (8, 8)),
+        # OpenMP threads, a per-node count without nodes, or a thread flag alone: nothing planned.
         (["srun", "--ntasks-per-node=8", "--cpus-per-task=4"], ["vasp_std"], ONE_NODE, (None, None)),
         (["srun", "-n", "8", "-c", "2"], ["vasp_std"], ONE_NODE, (None, None)),
         (["env", "OMP_NUM_THREADS=2", "srun", "-n", "8"], ["vasp_std"], {}, (None, None)),
         (["srun", "--ntasks-per-node=8"], ["vasp_std"], {}, (None, None)),
         (["srun", "--cpus-per-task=1"], ["vasp_std"], ONE_NODE, (None, None)),
-        (SRUN, ["vasp_std"], {"binding": {"nodes": [{"host": "a", "procs": 8, "gpus": 1}]}}, (None, None)),
         # An explicit OMP_NUM_THREADS decides the threads over cpus per task.
         (["env", "OMP_NUM_THREADS=1", "srun", "-n", "16", "-c", "2"], ["vasp_std"], {}, (16, None)),
         # A count below 1 is not a count.
@@ -268,7 +269,7 @@ def test_rank_sources(
 
 def test_omp_num_threads_leaves_the_rank_count_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OMP_NUM_THREADS", "4")
-    assert _attempt_ranks(SRUN, ["vasp_std"], ONE_NODE) == (None, None, "4 OpenMP threads per rank")
+    assert _attempt_ranks(SRUN, ["vasp_std"], ONE_NODE) == (None, None, "4 OpenMP threads per rank", 0)
     monkeypatch.setenv("OMP_NUM_THREADS", "1")
     assert _attempt_ranks(["srun", "-n", "16", "-c", "2"], ["vasp_std"], {})[:2] == (16, None)
 
@@ -284,6 +285,64 @@ def test_settings_resolve_parameter_then_variable_then_workspace(
     monkeypatch.setenv("HTTK_WORKFLOW_JOB_DIR", str(tmp_path))
     assert _setting("vasp.parallelization") == "off"
     assert _setting("vasp.ncl_command") is None
+
+
+FE2 = "Fe2\n1.0\n2.87 0 0\n0 2.87 0\n0 0 2.87\nFe\n2\nDirect\n0 0 0\n0.5 0.5 0.5\n"
+SI64 = "Si 64\n1.0\n10.86 0 0\n0 10.86 0\n0 0 10.86\nSi\n64\nDirect\n" + "0 0 0\n" * 64
+
+
+def test_a_gpu_binding_plans_ncore_1_and_kpar_for_a_command_without_a_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _write(tmp_path, "ISPIN = 2\n", _mesh("8 8 8"), FE2)
+    binding = {"binding": {"nodes": [{"host": "a", "procs": 4, "gpus": 4}]}}
+    monkeypatch.setenv("HTTK_WORKFLOW_CONTEXT", json.dumps(binding))
+    monkeypatch.setattr(os, "execvp", lambda *_: None)
+    main(["--standard", "mpirun -np 4 vasp_std", "--directory", str(root), "--no-launch"])
+    # One rank per GPU, all split over k-points: NPAR = 1, so NBANDS stays VASP's.
+    assert (root / "INCAR").read_text(encoding="utf-8") == "ISPIN = 2\nKPAR = 4\nNCORE = 1\n"
+    log = (root / "httk-vasp-launch.log").read_text(encoding="utf-8")
+    assert "parallel: 4 ranks on 4 GPUs, KPAR=4 NCORE=1" in log and "warning" not in log
+
+
+def test_without_a_binding_the_gpu_requirement_makes_a_gpu_run_and_gpus_0_forces_a_cpu_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _write(tmp_path, "ENCUT = 400\n", _mesh("8 8 8"), FE2)
+    monkeypatch.setenv("HTTK_WORKFLOW_CONTEXT", json.dumps({"resources": {"procs": 8, "gpus": 8}}))
+    monkeypatch.setattr(os, "execvp", lambda *_: None)
+    argv = ["--standard", "mpirun -np 8 vasp_std", "--directory", str(root), "--no-launch"]
+    main(argv)
+    assert (root / "INCAR").read_text(encoding="utf-8") == "ENCUT = 400\nKPAR = 8\nNCORE = 1\n"
+    root = _write(tmp_path, "ENCUT = 400\n", _mesh("8 8 8"), FE2)
+    main([*argv, "--gpus", "0"])
+    # The CPU plan: the same KPAR, but VASP's NCORE = 1 is not written and the log names no GPUs.
+    assert (root / "INCAR").read_text(encoding="utf-8") == "ENCUT = 400\nKPAR = 8\n"
+    assert "parallel: 8 ranks, KPAR=8 NCORE=1 (default NBANDS" in (root / "httk-vasp-launch.log").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_gpu_plans_skip_the_nions_floor_warn_on_rank_mismatch_and_still_round_nbands(tmp_path: Path) -> None:
+    # 64 ions on 4 GPUs: a CPU plan keeps 32 ranks per k-point group, a GPU plan splits over all 4 k-points.
+    plan = plan_parallelization(_write(tmp_path, "ENCUT = 400\n", _mesh("2 2 2"), SI64), ranks=4, gpus=4)
+    assert (plan.kpar, plan.ncore, plan.warnings) == (4, 1, ())
+    assert plan_parallelization(tmp_path, ranks=4).kpar is None
+    root = _write(tmp_path, RICH, _mesh("1 1 1"))
+    plan = plan_parallelization(root, ranks=8, gpus=4)
+    assert (plan.kpar, plan.ncore) == (None, 1)
+    assert plan.warnings == ("8 ranks on 4 GPUs; VASP's GPU port runs one rank per GPU",)
+    lines = _parallel_lines(root, "auto", "auto", 8, [], [], 4)
+    assert lines[0].startswith("parallel: 8 ranks on 4 GPUs, KPAR=1 NCORE=1") and lines[0].endswith("wrote NCORE=1")
+    assert _nbands_lines(root) == ["NBANDS = 64  # httk: rounded from default 60 for NPAR 8"]
+    root = _write(tmp_path, "NCORE = 4\n", _mesh("1 1 1"))
+    assert plan_parallelization(root, ranks=4, gpus=4).warnings == (
+        "NCORE=4 means NCORE=4; VASP's GPU port requires NCORE=1",
+    )
+    assert plan_parallelization(_write(tmp_path, "NPAR = 4\n"), ranks=4, gpus=4).warnings == ()
+    assert plan_parallelization(_write(tmp_path, "NPAR = 1\n"), ranks=4, gpus=4).warnings == (
+        "NPAR=1 means NCORE=4; VASP's GPU port requires NCORE=1",
+    )
 
 
 # Diamond with NELECT = 100 on one k-point: VASP's default is max(51 + 3, 60) = 60 bands, 2 x NELECT = 200.

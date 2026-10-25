@@ -85,25 +85,29 @@ def read_poscar_header(path: str | os.PathLike[str] = "POSCAR") -> PoscarHeader:
     return PoscarHeader(lines[0], scale, lattice, species, counts)
 
 
-def suggested_magnetic_moments(path: str | os.PathLike[str] = "POSCAR") -> str:
-    """Return the explicit comment override or a five-per-atom default.
+def _magmom_override(header: PoscarHeader) -> str | None:
+    """Return the ``[MAGMOM=...]`` override in the POSCAR comment, or ``None`` without one."""
 
-    The five Bohr magnetons per atom are a heuristic starting guess, not a
-    physical prediction: a deliberately high initial moment lets a spin-polarized
-    relaxation fall into a low-spin solution, whereas starting too low tends to keep
-    it there, so overestimating is the safer direction. The value of five is the
-    empirical default carried over from *httk* v1. Encode a per-structure choice in
-    the POSCAR comment as ``[MAGMOM=...]``.
+    override = re.search(r"\[MAGMOM=([^\]]+)\]", header.comment)
+    return None if override is None else override.group(1)
+
+
+def suggested_magnetic_moments(path: str | os.PathLike[str] = "POSCAR") -> str:
+    """Return the POSCAR comment's ``MAGMOM`` override, else VASP's default of one Bohr magneton per ion.
+
+    Without an override this is the ``MAGMOM`` VASP assumes for ``ISPIN = 2``
+    when the INCAR sets none, written per species as ``count*1``. *httk* v1's
+    five-per-atom starting guess is gone: a high-spin start is an explicit
+    ``MAGMOM`` in ``incar_tags`` or a per-structure ``[MAGMOM=...]`` in the
+    POSCAR comment.
 
     :param path: Read the POSCAR comment and species counts from this path.
-    :return: The explicit or generated MAGMOM value.
+    :return: The override or VASP's default MAGMOM value.
     """
 
     header = read_poscar_header(path)
-    override = re.search(r"\[MAGMOM=([^\]]+)\]", header.comment)
-    if override is not None:
-        return override.group(1)
-    return " ".join(f"{count}*5" for count in header.counts)
+    override = _magmom_override(header)
+    return override if override is not None else " ".join(f"{count}*1" for count in header.counts)
 
 
 def _cross(left: Sequence[float], right: Sequence[float]) -> tuple[float, float, float]:
@@ -641,7 +645,9 @@ def calculate_nbands(
 ) -> int:
     """Calculate a conservative VASP band count from input metadata.
 
-    The count is a heuristic, deliberately generous margin over VASP's own
+    This is an optional estimate for callers who want one; input preparation no
+    longer applies it, so an INCAR without ``NBANDS`` gets VASP's own default,
+    which the launch wrapper rounds to the band-group count. The count is a heuristic, deliberately generous margin over VASP's own
     default of roughly half the valence electrons plus half the atom count: too
     few bands is a run that stops with ``TOO FEW BANDS`` or converges to the wrong
     state, while a handful of extra empty bands costs only time. The spin-polarized
@@ -657,7 +663,7 @@ def calculate_nbands(
     :param incar: Read spin and magnetization tags from this INCAR.
     :param divisor: Round the result up to a multiple of this positive divisor.
     :param magmom: Use this ``MAGMOM`` for ``ISPIN = 2`` instead of the INCAR's, or, when the INCAR sets none,
-        instead of :func:`suggested_magnetic_moments`.
+        instead of :func:`suggested_magnetic_moments` (the POSCAR comment's override, else VASP's one per ion).
     :return: The conservative even band count.
     :raises ValueError: If the divisor or required input metadata is invalid.
     """
@@ -760,7 +766,8 @@ class VaspPreparationOptions:
     :param parallel_value: Set the value for the selected parallel tag.
     :param normalize_handedness: Normalize a left-handed POSCAR before preparation.
     :param incar_tags: Apply these explicit INCAR tags before derived defaults; a ``None`` value removes the tag
-        and suppresses its derived default, leaving it to VASP.
+        and suppresses its derived default, leaving it to VASP. ``MAGMOM`` is derived only from a POSCAR
+        ``[MAGMOM=...]`` comment and ``NBANDS`` never, so VASP's defaults apply unless these tags set them.
     """
 
     kpoint_density: float = 20.0
@@ -783,11 +790,13 @@ def prepare_vasp_inputs(
 
     ``incar_tags`` is applied to the INCAR first and wins over everything derived
     afterwards: the derived values are defaults for what the caller did not say,
-    so an explicit ``EDIFF``, ``MAGMOM``, or ``NBANDS`` survives preparation, and
-    an explicit ``ISPIN`` is what the band-count heuristic reads. A ``None`` value
+    so an explicit ``EDIFF`` or ``MAGMOM`` survives preparation. A ``None`` value
     asks for VASP's own default: the tag is removed from the INCAR (the template's
-    assignment included) and nothing is derived for it. The band-count heuristic
-    reads the ``MAGMOM`` the INCAR ends up with, VASP's one per atom when it is removed.
+    assignment included) and nothing is derived for it. ``MAGMOM`` is written only
+    from a POSCAR ``[MAGMOM=...]`` comment and ``NBANDS`` is never derived, so by
+    default VASP's own apply: one Bohr magneton per ion, and its default band
+    count, which the launch wrapper rounds to the band-group count. The returned
+    ``incar_updates`` holds exactly the derived tags written into the INCAR.
 
     :param options: Use these preparation options, or their defaults when unset.
     :param directory: Prepare the VASP inputs in this directory.
@@ -826,16 +835,9 @@ def prepare_vasp_inputs(
         atoms = sum(header.counts)
         updates["EDIFF"] = max(options.accuracy_per_atom * atoms / options.ediff_margin, 1e-6)
         updates["EDIFFG"] = max(options.accuracy_per_atom * atoms, 1e-4)
-    current = read_incar(incar)
-    if "MAGMOM" not in current and "MAGMOM" not in explicit:
-        updates["MAGMOM"] = suggested_magnetic_moments(poscar)
-    if "NBANDS" not in current and "NBANDS" not in explicit and (root / "POTCAR").is_file():
-        divisor = options.parallel_value if options.parallel_tag == "NPAR" else None
-        # The MAGMOM VASP will read: the one derived here, the INCAR's own, else VASP's default of 1 per ion.
-        magmom = str(updates.get("MAGMOM", current.get("MAGMOM", f"{sum(header.counts)}*1")))
-        updates["NBANDS"] = calculate_nbands(
-            poscar=poscar, potcar=root / "POTCAR", incar=incar, divisor=divisor, magmom=magmom
-        )
+    magmom = _magmom_override(header)
+    if magmom is not None and "MAGMOM" not in explicit and "MAGMOM" not in read_incar(incar):
+        updates["MAGMOM"] = magmom
     if options.parallel_tag is not None:
         if options.parallel_tag not in {"NPAR", "NCORE", "KPAR"}:
             raise ValueError("parallel_tag must be NPAR, NCORE, or KPAR")

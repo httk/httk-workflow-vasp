@@ -8,7 +8,8 @@ over k-points and bands, is only known once its ``INCAR``, ``POSCAR``,
 runs this module once per launch, in front of the attempt's launch prefix: it
 selects the binary, writes the ``KPAR``/``NCORE`` that
 :func:`httk.codes.vasp.parallel.plan_parallelization` plans into the INCAR
-unless the INCAR already sets them, rounds ``NBANDS`` to the resulting
+unless the INCAR already sets them (``NCORE = 1`` and a k-point split for GPUs
+in the attempt binding), rounds ``NBANDS`` to the resulting
 band-group count (an absent one to VASP's default, made explicit) unless
 ``vasp.nbands_rounding`` is ``off``, records each decision on stderr and in
 ``httk-vasp-launch.log``, and execs the launch prefix (``HTTK_WORKFLOW_LAUNCH``)
@@ -110,6 +111,14 @@ def _command(value: str) -> list[str]:
     return command
 
 
+def _nonnegative(value: str) -> int:
+    """Parse a nonnegative integer option."""
+
+    if not (value.isascii() and value.isdigit()):
+        raise argparse.ArgumentTypeError(f"not a nonnegative integer: {value!r}")
+    return int(value)
+
+
 def _positive(value: str) -> int:
     """Parse a positive integer option."""
 
@@ -183,8 +192,8 @@ def _launcher_flags(argv: Sequence[str]) -> dict[str, int]:
 
 def _attempt_ranks(
     prefix: Sequence[str], command: Sequence[str], context: Mapping[str, object]
-) -> tuple[int | None, int | None, str]:
-    """Return the launch's rank count, its ranks per node when known, and where they came from.
+) -> tuple[int | None, int | None, str, int]:
+    """Return the launch's rank count, its ranks per node when known, where they came from, and its GPU count.
 
     The launcher's own flags (the prefix's, or without a prefix the command's)
     win: ``-n``/``-np``/``--ntasks``, else ``--ntasks-per-node`` times the
@@ -193,57 +202,74 @@ def _attempt_ranks(
     resource requirement ``procs``. More than one OpenMP thread per rank (an
     explicit ``OMP_NUM_THREADS``, in the prefix or the environment, else
     ``--cpus-per-task``/srun's ``-c``), a thread flag without a derivable total,
-    a count below 1, and a binding with GPUs leave the count unknown, so nothing
-    is planned.
+    and a count below 1 leave the count unknown, so nothing is planned. The GPU
+    count is the sum of the binding nodes' ``gpus``, with or without a prefix;
+    without binding nodes it is the resource requirement's ``gpus``, and ``0``
+    when neither reports any.
     """
 
+    binding = context.get("binding")
+    nodes = binding.get("nodes") if isinstance(binding, dict) else None
+    nodes = nodes if isinstance(nodes, list) else []
+    gpus = sum(_count(node.get("gpus")) or 0 for node in nodes if isinstance(node, dict))
+    resources = context.get("resources")
+    if not nodes and isinstance(resources, dict):
+        # An aggregate allocation has no per-node binding: a job that requires GPUs is a GPU run.
+        gpus = _count(resources.get("gpus")) or 0
     flags = _launcher_flags(prefix or command)
     if any(value < 1 for value in flags.values()):
-        return None, None, "a launcher count below 1"
+        return None, None, "a launcher count below 1", gpus
     environment_threads = os.environ.get("OMP_NUM_THREADS", "")
     if "omp" not in flags and environment_threads.isdigit():
         flags["omp"] = int(environment_threads)
     # An explicit OMP_NUM_THREADS is what VASP runs with; cpus per task only implies threads without it.
     threads = flags.get("omp", flags.get("threads", 1))
     if threads > 1:
-        return None, None, f"{threads} OpenMP threads per rank"
+        return None, None, f"{threads} OpenMP threads per rank", gpus
     procs: list[int] = []
-    if prefix:
-        binding = context.get("binding")
-        nodes = binding.get("nodes") if isinstance(binding, dict) else None
-        if isinstance(nodes, list) and nodes:
-            if any(isinstance(node, dict) and _count(node.get("gpus")) for node in nodes):
-                return None, None, "the attempt binding has GPUs"
-            counts = [_count(node.get("procs")) if isinstance(node, dict) else None for node in nodes]
-            procs = [item for item in counts if item is not None]
-            if len(procs) != len(counts):
-                procs = []
+    if prefix and nodes:
+        counts = [_count(node.get("procs")) if isinstance(node, dict) else None for node in nodes]
+        procs = [item for item in counts if item is not None]
+        if len(procs) != len(counts):
+            procs = []
     if "total" in flags:
         per_node = flags.get("per_node") or (math.gcd(*procs) if procs and sum(procs) == flags["total"] else None)
-        return flags["total"], per_node, "the launcher's rank flag"
+        return flags["total"], per_node, "the launcher's rank flag", gpus
     if "per_node" in flags:
         if procs:
-            return flags["per_node"] * len(procs), flags["per_node"], "--ntasks-per-node times the binding's nodes"
-        return None, None, "--ntasks-per-node without a node count"
+            return (
+                flags["per_node"] * len(procs),
+                flags["per_node"],
+                "--ntasks-per-node times the binding's nodes",
+                gpus,
+            )
+        return None, None, "--ntasks-per-node without a node count", gpus
     if "threads" in flags:
-        return None, None, "a thread flag without a rank count"
+        return None, None, "a thread flag without a rank count", gpus
     if procs:
-        return sum(procs), math.gcd(*procs), "the attempt binding"
-    resources = context.get("resources") if prefix else None
-    procs_value = _count(resources.get("procs")) if isinstance(resources, dict) else None
+        return sum(procs), math.gcd(*procs), "the attempt binding", gpus
+    procs_value = _count(resources.get("procs")) if prefix and isinstance(resources, dict) else None
     if procs_value is not None:
-        return procs_value, None, "the attempt resources"
-    return None, None, "no binding, resources or launcher rank flag"
+        return procs_value, None, "the attempt resources", gpus
+    return None, None, "no binding, resources or launcher rank flag", gpus
 
 
 def _parallel_lines(
-    root: Path, mode: str, rounding: str, ranks_option: int | None, prefix: Sequence[str], command: Sequence[str]
+    root: Path,
+    mode: str,
+    rounding: str,
+    ranks_option: int | None,
+    prefix: Sequence[str],
+    command: Sequence[str],
+    gpus_option: int | None = None,
 ) -> list[str]:
     """Plan and apply the parallelization tags, then round NBANDS, returning the decision and warning lines."""
 
-    ranks, per_node, source = (
-        (ranks_option, None, "--ranks") if ranks_option is not None else _attempt_ranks(prefix, command, _context())
-    )
+    ranks, per_node, source, gpus = _attempt_ranks(prefix, command, _context())
+    if ranks_option is not None:
+        ranks, per_node, source = ranks_option, None, "--ranks"
+    if gpus_option is not None:
+        gpus = gpus_option
     lines: list[str] = []
     if mode == "off":
         lines.append("parallel: off (vasp.parallelization); INCAR unchanged")
@@ -251,7 +277,7 @@ def _parallel_lines(
         lines.append(f"parallel: rank count unknown ({source}); INCAR unchanged")
     else:
         try:
-            plan = plan_parallelization(root, ranks=ranks, ranks_per_node=per_node, nbands_rounding=rounding)
+            plan = plan_parallelization(root, ranks=ranks, ranks_per_node=per_node, nbands_rounding=rounding, gpus=gpus)
             tags = {name: value for name, value in (("KPAR", plan.kpar), ("NCORE", plan.ncore)) if value is not None}
             if tags:
                 update_incar(tags, root / "INCAR")
@@ -322,6 +348,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "vasp.nbands_rounding setting, else auto",
     )
     parser.add_argument("--ranks", type=_positive, help="plan for this many MPI ranks instead of the attempt's")
+    parser.add_argument(
+        "--gpus",
+        type=_nonnegative,
+        help="plan for this many GPUs instead of the attempt's (0 plans a CPU run)",
+    )
     parser.add_argument("--no-launch", action="store_true", help="exec the command without the launch prefix")
     arguments = parser.parse_args(argv)
     try:
@@ -333,7 +364,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"httk.codes.vasp.launch: {error}", file=sys.stderr)
         return 2
     root = Path(arguments.directory)
-    lines = _parallel_lines(root, mode, rounding, arguments.ranks, launched[: len(launched) - len(command)], command)
+    prefix = launched[: len(launched) - len(command)]
+    lines = _parallel_lines(root, mode, rounding, arguments.ranks, prefix, command, arguments.gpus)
     try:
         with (root / "httk-vasp-launch.log").open("a", encoding="utf-8") as log:
             log.writelines(f"{utc_now()} {line}\n" for line in lines)

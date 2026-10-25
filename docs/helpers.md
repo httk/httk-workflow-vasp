@@ -122,8 +122,9 @@ step_prepare() {
 The `httk_vasp_*` functions correspond directly to the Python helpers: `prepare`,
 `prepare_kpoints`, `prepare_potcar`, `get_tag`, `set_tag`, `unset_tag` (which
 removes a tag so VASP uses its default, and succeeds when it is absent) and
-`nbands` (which, like `calculate_nbands`, falls back to the five-per-atom
-`MAGMOM` estimate when the INCAR sets none); `run`,
+`nbands` (the optional conservative estimate of `calculate_nbands`, which
+preparation no longer applies; without an INCAR `MAGMOM` it reads the POSCAR
+comment's `[MAGMOM=...]`, else VASP's 1 per ion); `run`,
 `diagnose` and `report_problems` (which prints the distinct non-warning diagnostic
 codes of a run report, one per line); `remedy_plan`, `remedy_apply` and
 `remedy_reapply` (which prints the replayed changes as JSON); `preclean`,

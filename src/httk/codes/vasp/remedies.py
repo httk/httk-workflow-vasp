@@ -32,9 +32,11 @@ from .inputs import (
     _write_text_atomic,
     contcar_to_poscar,
     read_incar,
+    read_poscar_header,
     scale_poscar_lattice,
     update_incar,
 )
+from .parallel import _default_nbands, _nelect
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -93,7 +95,8 @@ _REVIEWED_SEQUENCES: dict[str, RemedySequence] = {
     # ZHEGV is a symptom, not proof of too few bands. For CPU MPI runs, first
     # remove band over-decomposition without guessing a rank-dependent NCORE:
     # NPAR=1 divides any rank count and takes precedence over inherited NCORE.
-    # Then reuse the bounded extra-empty-band edit, if NBANDS is explicit.
+    # Then reuse the bounded extra-empty-band edit, from VASP's default when
+    # NBANDS is absent.
     # No ALGO change: Normal uses Davidson; All can start with Davidson too
     # and is not valid for every functional. See docs/details/runtime_helpers.md.
     "edddav_zhegv": (
@@ -361,9 +364,12 @@ def _remedy_obstacle(root: Path, changes: Sequence[RemedyChange]) -> str | None:
     """Return why *changes* cannot be applied in *root*, or ``None`` when they can.
 
     Planning and application ask exactly this question, so a planned remedy is by
-    construction one that can be executed: proposing ``bump_bands`` for a
-    calculation whose INCAR never set ``NBANDS`` would otherwise reach
+    construction one that can be executed: proposing ``scale_ediff`` for a
+    calculation whose INCAR never set ``EDIFF`` would otherwise reach
     :func:`apply_vasp_remedy` and kill the runner with an uncaught error.
+    ``bump_bands`` on an INCAR without ``NBANDS`` starts from VASP's default
+    band count, so it needs what that count is computed from: the POSCAR, and
+    ``NELECT`` in the INCAR or a POTCAR.
     """
 
     tags: dict[str, str] | None = read_incar(root / "INCAR") if (root / "INCAR").is_file() else None
@@ -376,6 +382,20 @@ def _remedy_obstacle(root: Path, changes: Sequence[RemedyChange]) -> str | None:
             name = "EDIFF" if operation == "scale_ediff" else "NBANDS"
             if tags is None:
                 return f"{operation} needs an INCAR in {root}"
+            if name not in tags and operation == "bump_bands":
+                missing = [item for item in ("POSCAR", "POTCAR") if not (root / item).is_file()]
+                if "NELECT" in tags and "POTCAR" in missing:
+                    missing.remove("POTCAR")
+                if missing:
+                    return (
+                        f"{operation} needs NBANDS in INCAR, which does not set it, or, for VASP's default, "
+                        f"{' and '.join(missing)} in {root}"
+                    )
+                try:
+                    _default_bands(root, tags)
+                except (OSError, ValueError) as error:
+                    return f"{operation} cannot compute VASP's default NBANDS: {error}"
+                continue
             if name not in tags:
                 return f"{operation} needs {name} in INCAR, which does not set it"
             try:
@@ -542,10 +562,7 @@ def apply_vasp_remedy(
                     raise ValueError("cannot scale absent EDIFF")
                 incar_updates["EDIFF"] = float(tags["EDIFF"]) * float(str(value))
             elif operation == "bump_bands":
-                tags = read_incar(staging / "INCAR")
-                if "NBANDS" not in tags:
-                    raise ValueError("cannot bump absent NBANDS")
-                incar_updates["NBANDS"] = _bumped_bands(tags, value)
+                incar_updates["NBANDS"] = _bumped_bands(root, read_incar(staging / "INCAR"), value)
             elif operation in {"bump_kpoints", "equal_kpoints", "centering"}:
                 _modify_kpoints(staging / "KPOINTS", operation, value)
                 changed["KPOINTS"] = staging / "KPOINTS"
@@ -611,7 +628,8 @@ def reapply_vasp_remedies(
     ``incar.<TAG>`` assignments, ``scale_ediff``, ``bump_bands`` and the k-point
     operations are replayed onto the fresh INCAR and KPOINTS. ``scale_ediff`` is
     skipped when the fresh INCAR sets no ``EDIFF``, ``bump_bands`` when it sets no
-    ``NBANDS``, and the k-point operations when the stage has no KPOINTS file (a
+    ``NBANDS`` and VASP's default cannot be computed (no POSCAR, or neither
+    ``NELECT`` nor a POTCAR), and the k-point operations when the stage has no KPOINTS file (a
     ``KSPACING`` stage) or its KPOINTS is not a Gamma or Monkhorst-Pack automatic
     mesh (line-mode, explicit-list and fully automatic files are left untouched).
     The structure operations ``scale_lattice`` and ``contcar_to_poscar`` are
@@ -642,10 +660,9 @@ def reapply_vasp_remedies(
                     continue
                 update_incar({"EDIFF": float(tags["EDIFF"]) * float(str(value))}, incar)
             elif operation == "bump_bands":
-                tags = read_incar(incar)
-                if "NBANDS" not in tags:
+                if _remedy_obstacle(root, ((operation, value),)) is not None:
                     continue
-                update_incar({"NBANDS": _bumped_bands(tags, value)}, incar)
+                update_incar({"NBANDS": _bumped_bands(root, read_incar(incar), value)}, incar)
             elif operation in {"bump_kpoints", "equal_kpoints", "centering"}:
                 kpoints = root / "KPOINTS"
                 if not kpoints.is_file() or not _automatic_mesh(kpoints.read_text(encoding="utf-8").splitlines()):
@@ -659,10 +676,18 @@ def reapply_vasp_remedies(
     return tuple(applied)
 
 
-def _bumped_bands(tags: Mapping[str, str], value: object) -> int:
-    """Return ``NBANDS`` raised by *value* and rounded up to a multiple of ``NPAR``."""
+def _default_bands(root: Path, tags: Mapping[str, str]) -> int:
+    """Return VASP's default ``NBANDS`` for the POSCAR and POTCAR (or ``NELECT``) in *root* and INCAR *tags*."""
 
-    bands = int(tags["NBANDS"]) + int(str(value))
+    header = read_poscar_header(root / "POSCAR")
+    return _default_nbands(_nelect(root, tags, header), sum(header.counts), tags)
+
+
+def _bumped_bands(root: Path, tags: Mapping[str, str], value: object) -> int:
+    """Return ``NBANDS`` (VASP's default when absent) raised by *value* and rounded up to a multiple of ``NPAR``."""
+
+    base = int(tags["NBANDS"]) if "NBANDS" in tags else _default_bands(root, tags)
+    bands = base + int(str(value))
     if "NPAR" in tags:
         divisor = int(tags["NPAR"])
         if divisor < 1:

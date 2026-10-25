@@ -8,7 +8,9 @@ what it asked for. For an ``NBANDS`` the INCAR sets, VASP reports the change and
 custodian refuses the run as unrecoverable once the rounded value exceeds twice
 ``NELECT``; VASP's own default count is rounded silently, which only wastes
 time. :func:`plan_parallelization` chooses the two
-tags just before VASP starts, when every input and the rank count are known; the
+tags just before VASP starts, when every input and the rank count are known
+(on GPUs, ``NCORE = 1`` as VASP's OpenACC port requires, with one rank per
+GPU split over k-points); the
 launch wrapper :mod:`httk.codes.vasp.launch` writes them into the INCAR and then,
 unless ``vasp.nbands_rounding`` is ``off``, rounds ``NBANDS`` itself: an explicit
 value up to a multiple of ``NPAR``, an absent one to VASP's default made explicit
@@ -301,6 +303,7 @@ def plan_parallelization(
     ranks: int,
     ranks_per_node: int | None = None,
     nbands_rounding: str = "off",
+    gpus: int = 0,
 ) -> ParallelPlan:
     """Plan ``KPAR`` and ``NCORE`` for the VASP inputs in ``directory`` on ``ranks`` ranks.
 
@@ -330,19 +333,29 @@ def plan_parallelization(
     base it was rounded from. A planned value of ``1`` is VASP's default and is
     not written.
 
+    With ``gpus`` above 0 the run is planned for VASP's OpenACC port, which
+    requires ``NCORE = 1`` (written explicitly) and runs one rank per GPU:
+    ``KPAR`` is the largest divisor of ``ranks`` not above the irreducible
+    k-point bound (``1`` for ``LELF``/``LOPTICS``), with no per-group rank floor,
+    and a rank count other than ``gpus`` warns. An INCAR whose explicit tags
+    give an ``NCORE`` other than 1 on GPUs warns but is left as it is.
+
     :param directory: Read ``INCAR``, ``POSCAR``, ``POTCAR`` and ``KPOINTS`` from this directory.
     :param ranks: Plan for this many MPI ranks.
     :param ranks_per_node: Keep ``NCORE`` a divisor of this per-node rank count when known.
     :param nbands_rounding: ``"auto"`` when ``NBANDS`` is rounded to ``NPAR`` after planning, ``"off"`` (the
         default, for a caller that leaves ``NBANDS`` alone) when not.
+    :param gpus: Plan for VASP's GPU port on this many GPUs; ``0`` (the default) plans a CPU run.
     :return: The plan.
     :raises OSError: If a needed input file cannot be read.
-    :raises ValueError: If a needed input is malformed, ``ranks`` is not positive, or
+    :raises ValueError: If a needed input is malformed, ``ranks`` is not positive, ``gpus`` is negative, or
         ``nbands_rounding`` is neither ``"auto"`` nor ``"off"``.
     """
 
     if ranks < 1:
         raise ValueError("ranks must be positive")
+    if gpus < 0:
+        raise ValueError("gpus must not be negative")
     if nbands_rounding not in ("auto", "off"):
         raise ValueError(f"nbands_rounding must be 'auto' or 'off', not {nbands_rounding!r}")
     root = Path(directory)
@@ -352,10 +365,13 @@ def plan_parallelization(
         requested = _requested_nbands(text, incar)
     else:
         requested = int(float(incar["NBANDS"])) if "NBANDS" in incar else None
+    who = f"{ranks} ranks on {gpus} GPUs" if gpus else f"{ranks} ranks"
+    warnings: list[str] = []
+    if gpus and ranks != gpus:
+        warnings.append(f"{ranks} ranks on {gpus} GPUs; VASP's GPU port runs one rank per GPU")
     explicit = [tag for tag in ("NPAR", "NCORE", "KPAR") if tag in incar]
     if explicit:
         settings = " ".join(f"{tag}={incar[tag]}" for tag in explicit)
-        warnings: list[str] = []
         # With rounding on, the rounding step warns about this itself, except in a run it leaves to VASP.
         if requested is not None and (nbands_rounding == "off" or _left_alone(incar, ranks) is not None):
             nelect = _nelect(root, incar, read_poscar_header(root / "POSCAR"))
@@ -372,18 +388,30 @@ def plan_parallelization(
         size = int(float(incar.get(divider, "1")))
         if kpar < 1 or size < 1 or ranks % kpar or (ranks // kpar) % size:
             warnings.append(f"{ranks} ranks do not split evenly into KPAR={kpar} groups by {divider}={size}")
-        return ParallelPlan(ranks, None, None, f"{ranks} ranks, INCAR sets {settings}", tuple(warnings))
+        elif gpus and (ncore := size if divider == "NCORE" else ranks // kpar // size) != 1:
+            warnings.append(f"{settings} means NCORE={ncore}; VASP's GPU port requires NCORE=1")
+        return ParallelPlan(ranks, None, None, f"{who}, INCAR sets {settings}", tuple(warnings))
     reason = _left_alone(incar, ranks)
     if reason is not None:
-        return ParallelPlan(ranks, None, None, f"{ranks} ranks, left to VASP: {reason}")
+        return ParallelPlan(ranks, None, None, f"{who}, left to VASP: {reason}", tuple(warnings))
 
     header = read_poscar_header(root / "POSCAR")
     nions = sum(header.counts)
-    nelect = _nelect(root, incar, header)
     if _true(incar.get("LELF")) or _true(incar.get("LOPTICS")):
         n_k, source = 1, "LELF or LOPTICS, KPAR=1"
     else:
         n_k, source = _kpoint_bound(root, incar, header, limit=ranks)
+    if gpus:
+        # One rank per GPU: no band or plane-wave split inside a group, so no NIONS floor on the group size.
+        kpar = max(item for item in _divisors(ranks) if item <= n_k)
+        return ParallelPlan(
+            ranks,
+            kpar if kpar > 1 else None,
+            1,
+            f"{who}, KPAR={kpar} NCORE=1 (VASP's GPU port, NIONS={nions}, >={n_k} irreducible k-points from {source})",
+            tuple(warnings),
+        )
+    nelect = _nelect(root, incar, header)
     # Each k-point group keeps enough ranks for the bands and plane waves of a large cell.
     least = max(1, math.ceil(nions / 2))
     kpar = max(item for item in _divisors(ranks) if item == 1 or (item <= n_k and ranks // item >= least))

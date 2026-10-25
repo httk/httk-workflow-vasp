@@ -32,21 +32,27 @@ cleanup while preserving requested files. Diagnosis never changes inputs.
   workflow that already started there would have no such remedy left.
 - **Explicit tags win.** `VaspPreparationOptions.incar_tags` is written to the INCAR
   before anything is derived, and no derived value overwrites a tag the caller set.
+- **`MAGMOM` and `NBANDS` are VASP's.** Preparation derives neither: an INCAR
+  without them gets VASP's defaults, one Bohr magneton per ion for `ISPIN = 2`
+  and VASP's own band count. A per-structure `MAGMOM` comes from a
+  `[MAGMOM=...]` in the POSCAR comment, which preparation writes when the INCAR
+  and `incar_tags` set none; a high-spin start, or any other value, is an
+  explicit `incar_tags` `MAGMOM` (or `NBANDS`). An absent `NBANDS` may still
+  become explicit at launch: the launch wrapper writes VASP's default rounded to
+  the band-group count when the launch has more than one band group and the
+  rounded default stays within `2 × NELECT`, except in the runs it leaves to
+  VASP and when `vasp.nbands_rounding` is `off`
+  ([NBANDS rounding](#nbands-rounding)). The conservative band estimate
+  {py:func}`~httk.codes.vasp.calculate_nbands` (Bash `httk_vasp_nbands`) is
+  still available but no longer applied; it reads the INCAR's `MAGMOM`, and
+  without one {py:func}`~httk.codes.vasp.suggested_magnetic_moments` (the
+  POSCAR comment's override, else VASP's 1 per ion); pass `magmom=` to say
+  otherwise.
 - **`None` asks for VASP's own default.** An `incar_tags` value of `None` (JSON
   `null` in job parameters and in the Bash options file) removes the tag from the
-  INCAR, the template's assignment included, and suppresses the value preparation
-  would otherwise derive for it: `{"MAGMOM": null, "NBANDS": null}` leaves both to
-  VASP. The band-count heuristic then reads VASP's default `MAGMOM` of 1 per ion
-  for `ISPIN = 2`. A `null` `NBANDS` may still become explicit at launch: the
-  launch wrapper writes VASP's default rounded to the band-group count when the
-  launch has more than one band group and the rounded default stays within
-  `2 × NELECT`, except in the runs it leaves to VASP and when
-  `vasp.nbands_rounding` is `off` ([NBANDS rounding](#nbands-rounding)).
-  Used on its own, {py:func}`~httk.codes.vasp.calculate_nbands` (Bash
-  `httk_vasp_nbands`) reads the INCAR's `MAGMOM`, and without one falls back to
-  the five-per-atom estimate of
-  {py:func}`~httk.codes.vasp.suggested_magnetic_moments`, not VASP's 1 per ion;
-  pass `magmom=` to say otherwise.
+  INCAR, the template's assignment included, and suppresses any value preparation
+  would otherwise derive for it: `{"MAGMOM": null}` drops a template's `MAGMOM`
+  and a POSCAR comment's override alike.
 - **Updates rewrite statements, not lines.** {py:func}`~httk.codes.vasp.update_incar`
   understands the `;`-separated assignments {py:func}`~httk.codes.vasp.read_incar`
   reads, so updating one tag of `ISPIN = 2 ; ISYM = 2` leaves no second, stale
@@ -74,7 +80,8 @@ cleanup while preserving requested files. Diagnosis never changes inputs.
 Remedies are bounded, planned, and applied explicitly.
 {py:func}`~httk.codes.vasp.plan_vasp_remedy` validates every rung of the ladder
 against the calculation directory it is given and skips one it cannot execute — a
-`bump_bands` for an INCAR without `NBANDS`, a KPOINTS change with no KPOINTS staged, or
+`bump_bands` for an INCAR without `NBANDS` whose VASP default cannot be computed
+(no POSCAR, or neither `NELECT` nor a POTCAR), a KPOINTS change with no KPOINTS staged, or
 with a KPOINTS that is not a Gamma or Monkhorst-Pack automatic mesh (line-mode and
 explicit-list files are protected) — so
 {py:func}`~httk.codes.vasp.apply_vasp_remedy` never receives a remedy it would
@@ -115,14 +122,17 @@ The bounded CPU MPI ladder is:
    inherited NCORE settings. This directly targets excessive band decomposition
    before adding orbitals. It can be very slow: this is a recovery setting,
    not a recommended production layout, and does not reduce the allocation.
-2. `bump_bands = 2`: add two orbitals to an explicit INCAR `NBANDS`, retaining
+2. `bump_bands = 2`: add two orbitals to the INCAR's `NBANDS`, retaining
    `NPAR=1`. Extra empty states can help iterative eigensolver convergence
    ([NBANDS](https://www.vasp.at/wiki/NBANDS)). This reuses the `too_few_bands`
    operation but keeps separate diagnosis and history: ZHEGV has other causes.
    The increment is from INCAR, not the previous run's MPI-rounded effective
-   count. If NBANDS is absent, the planner skips this step and gives up; it
-   does not guess from electron count or stale output. Standard runner preparation
-   normally supplies NBANDS from the staged structure and POTCAR.
+   count. If NBANDS is absent, the increment is from VASP's default band count
+   (the `main.F` formula of [Parallelization planning](#parallelization-planning))
+   computed from the staged POSCAR and the POTCAR or the INCAR's `NELECT`, never
+   from stale output; when those are missing the planner skips this step and
+   gives up. The result is rounded up to a multiple of `NPAR` and written plain,
+   without the launch wrapper's marker.
 
 Both operations already exist in {py:func}`~httk.codes.vasp.apply_vasp_remedy`; no
 new operation is needed. The ZHEGV precedence is below geometry/factorization and
@@ -143,7 +153,9 @@ or of physical convergence. It does not repair bad geometries, corrupt restart
 files, an ill-conditioned overlap from another cause, compiler/BLAS/ScaLAPACK
 defects, memory exhaustion, or GPU/OpenMP placement. Plane-wave decomposition
 can itself remain excessive. GPU/threaded builds may ignore or constrain these
-parallelization tags; this ladder is not a reviewed remedy for those layouts.
+parallelization tags (VASP's GPU port requires `NCORE = 1`, which the launch
+wrapper plans for GPU bindings, see [Parallelization planning](#parallelization-planning));
+this ladder is not a reviewed remedy for those layouts.
 
 Stub tests cover classification, precedence, actual input edits, job-history
 escalation, manager recovery and terminal failure. They do not validate VASP
@@ -251,8 +263,22 @@ rounded `NBANDS` exceeds `2 × NELECT` as unrecoverable.
    non-collinear run (pymatgen's `estimate_nbands` notes it differs from the
    VASP wiki).
 
-A planned value of 1 is VASP's default and is not written, so the INCAR stays
-minimal. In rounding mode an `NBANDS` the wrapper wrote counts as the value it
+**GPUs.** A launch is a GPU run when the attempt binding reports GPUs (the sum
+of its nodes' `gpus`, known from Slurm's `--gpus`, `--gpus-per-node`,
+`--gpus-per-task` or `--gres=gpu:N`, with or without a launch prefix) or, when
+the allocation has no per-node binding, when the job's resource requirement asks
+for GPUs. Steps 3 and 4 then follow VASP's OpenACC port instead: `NCORE = 1`, which the port requires, and `KPAR` the
+largest divisor of the rank count at most the irreducible k-point bound (`1`
+for `LELF` and `LOPTICS`), without the `ceil(NIONS / 2)` floor, since a rank
+drives a whole GPU rather than a share of the bands. The port runs one rank per
+GPU, so a rank count other than the GPU count warns. Explicit tags (step 1) that
+amount to an `NCORE` other than 1 also warn but are kept, and the runs of step 2
+still get nothing. `NBANDS` is rounded as for any run, to
+`NPAR = ranks / KPAR`. `--gpus N` replaces the attempt's GPU count, and
+`--gpus 0` forces a CPU plan.
+
+A planned value of 1 is VASP's default and is not written, except `NCORE = 1`
+for GPUs, so the INCAR stays minimal. In rounding mode an `NBANDS` the wrapper wrote counts as the value it
 was rounded from (see below). The rank count is `--ranks` when given. Otherwise the launcher's own
 flags win (the prefix's, or without a prefix the command's): `-n`, `-np` or
 `--ntasks`, else `--ntasks-per-node` times the binding's node count. With a
@@ -260,8 +286,8 @@ prefix and no such flag, the attempt context's binding gives it (the sum of
 each node's `procs`, whose common divisor bounds `NCORE`), else its
 `resources` `procs`. Hybrid MPI/OpenMP runs (more than one thread per rank,
 from an explicit `OMP_NUM_THREADS` in the prefix or the environment, else
-`--cpus-per-task` or srun's `-c`), a thread flag without a rank count, a count
-below 1, and a binding with GPUs leave it unknown. When it is unknown nothing is
+`--cpus-per-task` or srun's `-c`), a thread flag without a rank count, and a
+count below 1 leave it unknown. When it is unknown nothing is
 planned, and the log line says why.
 
 Planning is on unless `--parallel off` is passed or the setting
@@ -291,8 +317,8 @@ tag), so rounding also works with `vasp.parallelization` `off`. Then:
   VASP (DFPT, `LHFCALC`, GW/BSE/ACFDT/RPA, `IMAGES`, one rank), which win over
   explicit tags; in these cases a value the wrapper wrote earlier still goes
   back to its base (an absent `NBANDS` for a `default` base), and the log says so;
-- nothing at all is done when the rank count is unknown (hybrid MPI/OpenMP or
-  GPU bindings included).
+- nothing at all is done when the rank count is unknown (hybrid MPI/OpenMP
+  included); GPU runs are rounded like any other.
 
 A value the wrapper writes carries a marker comment recording its base, for
 example `NBANDS = 40  # httk: rounded from 37 for NPAR 8`, or

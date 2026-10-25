@@ -36,6 +36,7 @@ from httk.codes.vasp import (
     remedy_policy_names,
     run_vasp,
     scale_poscar_lattice,
+    suggested_magnetic_moments,
     update_incar,
     write_automatic_kpoints,
 )
@@ -392,7 +393,8 @@ def test_the_chosen_pseudopotential_variant_is_returned_and_recorded(tmp_path: P
     assert isinstance(potcar, dict)
     assert potcar["potentials"][0]["variant"] == "Si_sv"
     assert read_incar(tmp_path / "INCAR")["ENCUT"] == "520"
-    assert read_incar(tmp_path / "INCAR")["NBANDS"]
+    # VASP's own defaults: preparation derives neither MAGMOM nor NBANDS.
+    assert not {"MAGMOM", "NBANDS"} & set(read_incar(tmp_path / "INCAR"))
 
 
 def test_explicit_incar_tags_win_over_every_derived_value(tmp_path: Path) -> None:
@@ -424,17 +426,46 @@ def test_null_incar_tags_leave_magmom_and_nbands_to_vasp(tmp_path: Path) -> None
     assert prepared["incar_tags"] == {"MAGMOM": None, "NBANDS": None}
 
 
-def test_the_band_heuristic_reads_the_magmom_the_incar_ends_up_with(tmp_path: Path) -> None:
-    # Ten Si atoms: five per atom gives 25 + ceil(50 / 2) = 50 bands, VASP's one per atom 25 + 20 = 45, made even.
-    (tmp_path / "POSCAR").write_text(
-        "Si10\n1.0\n10 0 0\n0 10 0\n0 0 10\nSi\n10\nDirect\n" + "0 0 0\n" * 10, encoding="utf-8"
-    )
+def test_preparation_leaves_magmom_and_nbands_to_vasp_unless_the_poscar_comment_sets_magmom(tmp_path: Path) -> None:
+    _poscar(tmp_path)
     (tmp_path / "POTCAR").write_text("TITEL = PAW Si\n ZVAL = 4.000\n", encoding="utf-8")
-    for incar_tags, magmom, nbands in (({}, "10*5", "50"), ({"MAGMOM": None}, None, "46")):
-        (tmp_path / "INCAR").write_text("ISPIN = 2\n", encoding="utf-8")
+    (tmp_path / "INCAR").write_text("ISPIN = 2\n", encoding="utf-8")
+    prepared = prepare_vasp_inputs(directory=tmp_path)
+    assert not {"MAGMOM", "NBANDS"} & set(read_incar(tmp_path / "INCAR"))
+    updates = prepared["incar_updates"]
+    assert isinstance(updates, dict) and set(updates) == {"EDIFF", "EDIFFG"}
+
+    (tmp_path / "POSCAR").write_text(_POSCAR.replace("silicon", "silicon [MAGMOM=2*3]"), encoding="utf-8")
+    for incar_tags, magmom in (({}, "2*3"), ({"MAGMOM": "2*5"}, "2*5"), ({"MAGMOM": None}, None)):
+        (tmp_path / "INCAR").write_text(
+            "ISPIN = 2\nMAGMOM = 2*4\n" if magmom is None else "ISPIN = 2\n", encoding="utf-8"
+        )
         prepare_vasp_inputs(VaspPreparationOptions(incar_tags=incar_tags), directory=tmp_path)
         tags = read_incar(tmp_path / "INCAR")
-        assert (tags.get("MAGMOM"), tags["NBANDS"]) == (magmom, nbands)
+        assert (tags.get("MAGMOM"), "NBANDS" in tags) == (magmom, False)
+    assert suggested_magnetic_moments(tmp_path / "POSCAR") == "2*3"
+    _poscar(tmp_path)
+    assert suggested_magnetic_moments(tmp_path / "POSCAR") == "2*1"
+
+
+def test_bump_bands_without_nbands_starts_from_vasps_default(tmp_path: Path) -> None:
+    # Two Si atoms, NELECT = 8: VASP's default is max(5 + 3, 4) = 8 bands; NELECT = 20 gives 11 + 3 = 14, plus 2 rounded to NPAR = 3 is 18.
+    _poscar(tmp_path)
+    (tmp_path / "INCAR").write_text("ENCUT = 400\n", encoding="utf-8")
+    too_few = (Diagnostic("too_few_bands", "error", "bands", "stdout"),)
+    skipped = plan_vasp_remedy(too_few, directory=tmp_path, history_path=tmp_path / "skipped.json")
+    assert skipped.give_up and "for VASP's default, POTCAR in" in skipped.reason
+
+    (tmp_path / "POTCAR").write_text("TITEL = PAW Si\n ZVAL = 4.000\n", encoding="utf-8")
+    decision = plan_vasp_remedy(too_few, directory=tmp_path, history_path=tmp_path / "history.json")
+    assert decision.changes == (("bump_bands", 2),)
+    apply_vasp_remedy(decision, directory=tmp_path, history_path=tmp_path / "history.json")
+    assert (tmp_path / "INCAR").read_text(encoding="utf-8") == "ENCUT = 400\nNBANDS = 10\n"
+
+    (tmp_path / "POTCAR").unlink()
+    (tmp_path / "INCAR").write_text("NELECT = 20\nNPAR = 3\n", encoding="utf-8")
+    assert reapply_vasp_remedies(directory=tmp_path, history_path=tmp_path / "history.json") == (("bump_bands", 2),)
+    assert read_incar(tmp_path / "INCAR")["NBANDS"] == "18"
 
 
 def test_a_remedy_with_a_none_value_removes_the_tag_and_replays_as_removal(
