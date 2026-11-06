@@ -58,7 +58,9 @@ register_citation(
 
 from . import collect as _collect  # noqa: F401
 from .diagnostics import (
+    VASP_CHECKS,
     VASP_RESTART_ARTIFACTS,
+    VaspCheck,
     clean_outcar,
     clean_vasp_outputs,
     diagnose_vasp_files,
@@ -66,6 +68,7 @@ from .diagnostics import (
     last_vasprun_volume,
     outcar_plane_wave_count,
     outcar_potim,
+    parse_diagnostic_policy,
     validate_vasp_workdir,
 )
 from .inputs import (
@@ -81,6 +84,7 @@ from .inputs import (
     contcar_to_poscar,
     derive_seed,
     normalize_poscar_handedness,
+    parse_potcar_variants,
     potcar_summary,
     prepare_vasp_inputs,
     rattle_poscar,
@@ -104,18 +108,20 @@ from .remedies import (
     remedy_policy,
     remedy_policy_names,
 )
-from .reports import VaspRunReport, run_vasp
+from .reports import VaspRunReport, read_checker_specs, run_vasp
 
 __all__ = [
     "DEFAULT_KPOINT_CENTERING",
     "DEFAULT_REMEDY_HISTORY",
     "KPOINT_CENTERINGS",
     "REMEDY_OPERATIONS",
+    "VASP_CHECKS",
     "VASP_RESTART_ARTIFACTS",
     "PoscarHeader",
     "PotcarAssembly",
     "PotcarChoice",
     "RemedyPolicy",
+    "VaspCheck",
     "VaspPreparationOptions",
     "VaspRemedyDecision",
     "VaspRunReport",
@@ -134,10 +140,13 @@ __all__ = [
     "normalize_poscar_handedness",
     "outcar_plane_wave_count",
     "outcar_potim",
+    "parse_diagnostic_policy",
+    "parse_potcar_variants",
     "plan_vasp_remedy",
     "potcar_summary",
     "prepare_vasp_inputs",
     "rattle_poscar",
+    "read_checker_specs",
     "read_incar",
     "read_poscar_header",
     "reapply_vasp_remedies",

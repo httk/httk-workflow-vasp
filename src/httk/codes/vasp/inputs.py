@@ -339,6 +339,7 @@ class PotcarChoice:
     :param source: Record the source potential path.
     :param sha256: Record the source file digest.
     :param titel: Record the potential's ``TITEL`` value, when present.
+    :param override: Record whether the variant was named explicitly rather than chosen by suffix.
     """
 
     species: str
@@ -347,6 +348,7 @@ class PotcarChoice:
     source: Path
     sha256: str
     titel: str | None
+    override: bool = False
 
     def as_mapping(self) -> dict[str, object]:
         """Serialize the potential choice.
@@ -360,6 +362,7 @@ class PotcarChoice:
             "source": str(self.source),
             "sha256": self.sha256,
             "titel": self.titel,
+            "override": self.override,
         }
 
 
@@ -393,6 +396,55 @@ class PotcarAssembly:
         }
 
 
+def parse_potcar_variants(value: object) -> dict[str, str]:
+    """Parse per-species pseudopotential variant overrides.
+
+    The overrides name the full variant directory of a species, the way VASP
+    users name potentials: ``{"Hf": "Hf_pv"}``, or the space-separated string
+    ``"Hf=Hf_pv Zr=Zr_sv"`` that Bash runners and workspace settings carry.
+    A variant is the species itself or the species followed by ``_``, ``.`` or a
+    digit (``Hf_pv``, ``H.5``, ``H1.25``).
+    Species are matched as written in the POSCAR; an override for a species the
+    POSCAR does not contain is unused.
+
+    :param value: Parse this mapping, ``SPECIES=VARIANT`` string, or ``None``/``""`` for no overrides.
+    :return: The validated species to variant mapping.
+    :raises ValueError: If the value or one of its entries is malformed, a species
+        repeats, or a variant does not belong to its species.
+    """
+
+    if value is None or value == "":
+        return {}
+    pairs: list[tuple[object, object]] = []
+    if isinstance(value, str):
+        for token in value.split():
+            name, separator, directory = token.partition("=")
+            if not separator:
+                raise ValueError(f"potcar_variants entry {token!r} is not of the form SPECIES=VARIANT")
+            pairs.append((name, directory))
+    elif isinstance(value, Mapping):
+        pairs.extend(value.items())
+    else:
+        raise ValueError(
+            f"potcar_variants must be a mapping or a 'SPECIES=VARIANT ...' string, not {type(value).__name__}"
+        )
+    variants: dict[str, str] = {}
+    for species, variant in pairs:
+        if not isinstance(species, str) or not isinstance(variant, str) or not species or not variant:
+            raise ValueError(f"potcar_variants entry {species!r}={variant!r} needs a nonempty species and variant")
+        if species in variants:
+            raise ValueError(f"potcar_variants names species {species!r} more than once")
+        # ``Hf_pv``, and the fractional hydrogens ``H.5`` and ``H1.25``; never ``He`` for ``H``.
+        following = variant[len(species) : len(species) + 1]
+        if not variant.startswith(species) or (following and following not in "_." and not following.isdigit()):
+            raise ValueError(f"potcar_variants entry {species}={variant} names a variant of another species")
+        # The variant becomes a directory below the library root.
+        if any(character.isspace() or character in "/\\" for character in variant):
+            raise ValueError(f"potcar_variants entry {species}={variant!r} is not a plain directory name")
+        variants[species] = variant
+    return variants
+
+
 def assemble_potcar(
     library: str | os.PathLike[str],
     *,
@@ -400,32 +452,40 @@ def assemble_potcar(
     output: str | os.PathLike[str] = "POTCAR",
     suffix_preference: Iterable[str] = ("_3", "_2", "_d", "_sv", "_pv", "", "_h", "_s"),
     provenance: str | os.PathLike[str] | None = None,
+    variants: Mapping[str, str] | None = None,
 ) -> PotcarAssembly:
     """Assemble POTCAR from explicit species and a configurable suffix policy.
 
     The suffix policy decides which PAW variant each species gets, so the result
     describes what it chose: the returned :class:`PotcarAssembly` names every
     potential, and the same record is written next to the POTCAR as
-    ``<POTCAR>.provenance.json`` unless *provenance* names another file.
+    ``<POTCAR>.provenance.json`` unless *provenance* names another file. A species
+    named in *variants* gets exactly that variant directory, never a fallback, and
+    its choice is recorded with ``override`` set.
 
     :param library: Search this pseudopotential library root.
     :param poscar: Read species names from this POSCAR.
     :param output: Write the assembled POTCAR to this path.
     :param suffix_preference: Try these species suffixes in order.
     :param provenance: Write provenance to this path, or beside the POTCAR when unset.
+    :param variants: Use these variant directories for the named species, as accepted by
+        :func:`parse_potcar_variants`, instead of the suffix policy.
     :return: The assembled POTCAR and its provenance.
-    :raises FileNotFoundError: If a species has no matching potential.
+    :raises FileNotFoundError: If a species has no matching potential, or a named variant is missing.
+    :raises ValueError: If *variants* is malformed.
     """
 
     root = Path(library).expanduser().resolve()
     header = read_poscar_header(poscar)
     suffixes = tuple(suffix_preference)
+    overrides = parse_potcar_variants(variants)
     pieces: list[bytes] = []
     choices: list[PotcarChoice] = []
     for species in header.species:
         found: Path | None = None
         variant = ""
-        for suffix in suffixes:
+        override = species in overrides
+        for suffix in (overrides[species][len(species) :],) if override else suffixes:
             directory = root / f"{species}{suffix}"
             for filename in ("POTCAR", "POTCAR.gz", "POTCAR.bz2", "POTCAR.xz", "POTCAR.lzma", "POTCAR.Z"):
                 candidate = directory / filename
@@ -435,6 +495,8 @@ def assemble_potcar(
                     break
             if found is not None:
                 break
+        if found is None and override:
+            raise FileNotFoundError(f"no pseudopotential {overrides[species]!r} for species {species!r} below {root}")
         if found is None:
             raise FileNotFoundError(f"no pseudopotential found for species {species!r} below {root}")
         content = _read_potential(found)
@@ -448,6 +510,7 @@ def assemble_potcar(
                 found,
                 sha256_file(found),
                 None if titel is None else titel.group(1).strip(),
+                override,
             )
         )
     destination = Path(output)
@@ -762,6 +825,8 @@ class VaspPreparationOptions:
     :param accuracy_per_atom: Set the target total-energy accuracy, or disable derived accuracy tags when unset.
     :param ediff_margin: Divide the cell accuracy by this margin for ``EDIFF``.
     :param pseudopotential_library: Assemble POTCAR from this library when set.
+    :param potcar_variants: Pin these species to the named variant directories (``{"Hf": "Hf_pv"}``)
+        instead of the suffix policy; see :func:`parse_potcar_variants`.
     :param parallel_tag: Set the selected parallel INCAR tag when set.
     :param parallel_value: Set the value for the selected parallel tag.
     :param normalize_handedness: Normalize a left-handed POSCAR before preparation.
@@ -779,6 +844,7 @@ class VaspPreparationOptions:
     parallel_value: int | None = None
     normalize_handedness: bool = True
     incar_tags: Mapping[str, object] = field(default_factory=dict)
+    potcar_variants: Mapping[str, str] = field(default_factory=dict)
 
 
 def prepare_vasp_inputs(
@@ -826,6 +892,7 @@ def prepare_vasp_inputs(
             options.pseudopotential_library,
             poscar=poscar,
             output=root / "POTCAR",
+            variants=options.potcar_variants,
         ).as_mapping()
     grid = automatic_kpoint_grid(options.kpoint_density, poscar=poscar)
     write_automatic_kpoints(grid, root / "KPOINTS", centering=options.centering)

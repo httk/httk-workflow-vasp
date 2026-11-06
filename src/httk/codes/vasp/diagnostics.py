@@ -9,8 +9,10 @@ validation and cleanup helpers. Historical authorship is documented in
 
 import os
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from httk.workflow.codes import Diagnostic
 
@@ -191,50 +193,142 @@ def clean_vasp_outputs(
     return tuple(removed)
 
 
-_VASP_PATTERNS: tuple[tuple[re.Pattern[str], str, str, bool], ...] = (
-    (re.compile(r"chargedensity file is incomplete", re.IGNORECASE), "chgcar_incomplete", "error", True),
-    (re.compile(r"ZPOTRF failed", re.IGNORECASE), "zpotrf", "fatal", True),
-    (re.compile(r"FEXCF: supplied exchange-correlation table", re.IGNORECASE), "fexcf", "error", True),
-    (
-        re.compile(r"Reciprocal lattice and k-lattice belong to different class", re.IGNORECASE),
+@dataclass(frozen=True)
+class VaspCheck:
+    """One live check :func:`~httk.codes.vasp.run_vasp` applies to VASP output lines.
+
+    :param code: Name the diagnostic the check emits; the remedy planner selects a remedy by this code.
+    :param pattern: Match an OUTCAR, OSZICAR, stdout or stderr line with this expression.
+    :param severity: Classify the emitted diagnostic.
+    :param stop: Terminate the run when the check matches.
+    """
+
+    code: str
+    pattern: re.Pattern[str]
+    severity: Literal["info", "warning", "error", "fatal"]
+    stop: bool
+
+
+#: The live checks :func:`~httk.codes.vasp.run_vasp` applies to every OUTCAR,
+#: OSZICAR, stdout and stderr line. Besides them it applies the numeric
+#: ``realspace_allocation_too_large`` check (a real-space projection allocation
+#: above 500000 KBytes, a stopping ``fatal`` diagnostic).
+VASP_CHECKS: tuple[VaspCheck, ...] = (
+    VaspCheck("chgcar_incomplete", re.compile(r"chargedensity file is incomplete", re.IGNORECASE), "error", True),
+    VaspCheck("zpotrf", re.compile(r"ZPOTRF failed", re.IGNORECASE), "fatal", True),
+    VaspCheck("fexcf", re.compile(r"FEXCF: supplied exchange-correlation table", re.IGNORECASE), "error", True),
+    VaspCheck(
         "kpoints_class",
+        re.compile(r"Reciprocal lattice and k-lattice belong to different class", re.IGNORECASE),
         "error",
         True,
     ),
-    (
-        re.compile(r"Tetrahedron method fails|Fatal error.*k-mesh|unable to match k-point|TETIRR needs", re.IGNORECASE),
+    VaspCheck(
         "tetrahedron_kpoints",
+        re.compile(r"Tetrahedron method fails|Fatal error.*k-mesh|unable to match k-point|TETIRR needs", re.IGNORECASE),
         "error",
         True,
     ),
-    (re.compile(r"inverse of rotation matrix was not found", re.IGNORECASE), "inverse_rotation", "error", True),
-    (re.compile(r"Found some non-integer element in rotation matrix", re.IGNORECASE), "rotation_matrix", "error", True),
-    (re.compile(r"BRMIX: very serious problems", re.IGNORECASE), "brmix", "warning", False),
-    (re.compile(r"Could not get correct shifts", re.IGNORECASE), "kpoint_shifts", "warning", False),
-    (re.compile(r"REAL_OPTLAY: internal error", re.IGNORECASE), "real_optlay", "error", True),
-    (re.compile(r"(?:internal ERROR RSPHER|RSPHER: internal ERROR)", re.IGNORECASE), "rspher", "fatal", True),
-    (re.compile(r"DENTET: can't reach specified precision", re.IGNORECASE), "dentet", "warning", False),
-    (re.compile(r"TOO FEW BANDS", re.IGNORECASE), "too_few_bands", "error", False),
-    (re.compile(r"triple product of the basis vectors", re.IGNORECASE), "triple_product", "fatal", True),
-    (re.compile(r"BRIONS problems: POTIM should be increased", re.IGNORECASE), "brions", "warning", False),
-    (re.compile(r"small aliasing.*errors", re.IGNORECASE), "aliasing", "warning", False),
-    (re.compile(r"distance between some ions is very small", re.IGNORECASE), "ions_too_close", "fatal", True),
-    (re.compile(r"set LREAL=.FALSE", re.IGNORECASE), "lreal_false", "error", True),
-    (re.compile(r"number of cells and number of vectors did not agree", re.IGNORECASE), "pricell", "error", True),
-    (re.compile(r"internal error in RAD_INT", re.IGNORECASE), "radint", "fatal", True),
-    (re.compile(r"internal ERROR in NONLR_ALLOC", re.IGNORECASE), "nonlr_alloc", "fatal", True),
+    VaspCheck(
+        "inverse_rotation", re.compile(r"inverse of rotation matrix was not found", re.IGNORECASE), "error", True
+    ),
+    VaspCheck(
+        "rotation_matrix",
+        re.compile(r"Found some non-integer element in rotation matrix", re.IGNORECASE),
+        "error",
+        True,
+    ),
+    VaspCheck("brmix", re.compile(r"BRMIX: very serious problems", re.IGNORECASE), "warning", False),
+    VaspCheck("kpoint_shifts", re.compile(r"Could not get correct shifts", re.IGNORECASE), "warning", False),
+    VaspCheck("real_optlay", re.compile(r"REAL_OPTLAY: internal error", re.IGNORECASE), "error", True),
+    VaspCheck("rspher", re.compile(r"(?:internal ERROR RSPHER|RSPHER: internal ERROR)", re.IGNORECASE), "fatal", True),
+    VaspCheck("dentet", re.compile(r"DENTET: can't reach specified precision", re.IGNORECASE), "warning", False),
+    VaspCheck("too_few_bands", re.compile(r"TOO FEW BANDS", re.IGNORECASE), "error", False),
+    VaspCheck("triple_product", re.compile(r"triple product of the basis vectors", re.IGNORECASE), "fatal", True),
+    VaspCheck("brions", re.compile(r"BRIONS problems: POTIM should be increased", re.IGNORECASE), "warning", False),
+    VaspCheck("aliasing", re.compile(r"small aliasing.*errors", re.IGNORECASE), "warning", False),
+    VaspCheck("ions_too_close", re.compile(r"distance between some ions is very small", re.IGNORECASE), "fatal", True),
+    VaspCheck("lreal_false", re.compile(r"set LREAL=.FALSE", re.IGNORECASE), "error", True),
+    VaspCheck(
+        "pricell", re.compile(r"number of cells and number of vectors did not agree", re.IGNORECASE), "error", True
+    ),
+    VaspCheck("radint", re.compile(r"internal error in RAD_INT", re.IGNORECASE), "fatal", True),
+    VaspCheck("nonlr_alloc", re.compile(r"internal ERROR in NONLR_ALLOC", re.IGNORECASE), "fatal", True),
     # VASP 5/6 use EDDDAV or EDDAV, with or without "Error", also inside a box.
     # Keep the historical diagnostic code so existing consumers/history work.
-    (
-        re.compile(r"\b(?:Error\s+)?EDD?DAV\s*:\s*Call\s+to\s+ZHEGV\s+failed\b", re.IGNORECASE),
+    VaspCheck(
         "edddav_zhegv",
+        re.compile(r"\b(?:Error\s+)?EDD?DAV\s*:\s*Call\s+to\s+ZHEGV\s+failed\b", re.IGNORECASE),
         "error",
         False,
     ),
-    (re.compile(r"CNORMN: search vector ill defined", re.IGNORECASE), "cnormn", "warning", False),
-    (re.compile(r"ZBRENT: fatal error in bracketing", re.IGNORECASE), "zbrent_bracketing", "error", False),
-    (re.compile(r"One of the lattice vectors is very long", re.IGNORECASE), "lattice_vector_too_long", "fatal", True),
+    VaspCheck("cnormn", re.compile(r"CNORMN: search vector ill defined", re.IGNORECASE), "warning", False),
+    VaspCheck("zbrent_bracketing", re.compile(r"ZBRENT: fatal error in bracketing", re.IGNORECASE), "error", False),
+    VaspCheck(
+        "lattice_vector_too_long", re.compile(r"One of the lattice vectors is very long", re.IGNORECASE), "fatal", True
+    ),
 )
+
+
+#: The live check :mod:`~httk.codes.vasp.reports` applies besides :data:`VASP_CHECKS`.
+_ALLOCATION_CODE = "realspace_allocation_too_large"
+_POLICY_ACTIONS = frozenset({"stop", "continue", "ignore"})
+#: Codes only :func:`diagnose_vasp_files` produces, after the run.
+_POST_RUN_CODES = frozenset(
+    {"incomplete_outcar", "electronic_nonconvergence", "ionic_nonconvergence", "positive_final_energy"}
+)
+
+
+def parse_diagnostic_policy(value: object, *, checks: Sequence[VaspCheck] = VASP_CHECKS) -> dict[str, str]:
+    """Parse a per-code policy for the live VASP checks.
+
+    The policy maps a live diagnostic code to ``stop`` (end the run when it
+    matches), ``continue`` (report it but let the run go on) or ``ignore`` (drop
+    it entirely, so the remedy planner never sees it either): ``{"brmix": "stop"}``,
+    or the space-separated string ``"brmix=stop zpotrf=continue"`` that Bash
+    runners and workspace settings carry.
+
+    :param value: Parse this mapping, ``CODE=ACTION`` string, or ``None``/``""`` for no policy.
+    :param checks: Accept the codes of these checks, besides ``realspace_allocation_too_large``.
+    :return: The validated code to action mapping.
+    :raises ValueError: If the value or one of its entries is malformed, a code
+        repeats or is unknown, a code is one the post-run file diagnosis produces,
+        or an action is not ``stop``, ``continue`` or ``ignore``.
+    """
+
+    if value is None or value == "":
+        return {}
+    pairs: list[tuple[object, object]] = []
+    if isinstance(value, str):
+        for token in value.split():
+            name, separator, choice = token.partition("=")
+            if not separator:
+                raise ValueError(f"diagnostic_policy entry {token!r} is not of the form CODE=ACTION")
+            pairs.append((name, choice))
+    elif isinstance(value, Mapping):
+        pairs.extend(value.items())
+    else:
+        raise ValueError(
+            f"diagnostic_policy must be a mapping or a 'CODE=ACTION ...' string, not {type(value).__name__}"
+        )
+    known = {check.code for check in checks} | {_ALLOCATION_CODE}
+    policy: dict[str, str] = {}
+    for code, action in pairs:
+        if not isinstance(code, str) or not isinstance(action, str) or not code or not action:
+            raise ValueError(f"diagnostic_policy entry {code!r}={action!r} needs a nonempty code and action")
+        if code in policy:
+            raise ValueError(f"diagnostic_policy names code {code!r} more than once")
+        if code not in known:
+            if code in _POST_RUN_CODES:
+                # Accepting a nonconverged or incomplete run as completed is deliberately not offered.
+                raise ValueError(
+                    f"diagnostic_policy entry {code!r} is a post-run file diagnosis; the policy governs live checks only"
+                )
+            raise ValueError(f"diagnostic_policy names unknown code {code!r}; known codes: {', '.join(sorted(known))}")
+        if action not in _POLICY_ACTIONS:
+            raise ValueError(f"diagnostic_policy entry {code}={action} is not one of stop, continue, ignore")
+        policy[code] = action
+    return policy
 
 
 def diagnose_vasp_files(directory: str | os.PathLike[str] = ".") -> tuple[Diagnostic, ...]:

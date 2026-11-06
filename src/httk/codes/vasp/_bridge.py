@@ -33,10 +33,12 @@ from . import (
     normalize_poscar_handedness,
     outcar_plane_wave_count,
     outcar_potim,
+    parse_potcar_variants,
     plan_vasp_remedy,
     potcar_summary,
     prepare_vasp_inputs,
     rattle_poscar,
+    read_checker_specs,
     read_incar,
     reapply_vasp_remedies,
     run_vasp,
@@ -89,6 +91,7 @@ def add_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]"
     potcar.add_argument("library")
     potcar.add_argument("--poscar", default="POSCAR")
     potcar.add_argument("--output", default="POTCAR")
+    potcar.add_argument("--variants", default="")
     nbands = commands.add_parser("vasp-nbands")
     nbands.add_argument("--poscar", default="POSCAR")
     nbands.add_argument("--potcar", default="POTCAR")
@@ -136,6 +139,8 @@ def add_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]"
     vasp_run.add_argument("--dispatch", action=argparse.BooleanOptionalAction, default=True)
     vasp_run.add_argument("--grace", type=float, default=10.0)
     vasp_run.add_argument("--report", default="vasp-run-report.json")
+    vasp_run.add_argument("--policy", default="")
+    vasp_run.add_argument("--checker", action="append", default=[])
     vasp_run.add_argument("argv", nargs=argparse.REMAINDER)
     diagnose = commands.add_parser("vasp-diagnose")
     diagnose.add_argument("--directory", default=".")
@@ -229,7 +234,12 @@ def run_command(arguments: argparse.Namespace) -> int:
         write_automatic_kpoints(grid, arguments.output, centering=arguments.centering)
         print(" ".join(str(value) for value in grid))
     elif command == "vasp-potcar":
-        assemble_potcar(arguments.library, poscar=arguments.poscar, output=arguments.output)
+        assemble_potcar(
+            arguments.library,
+            poscar=arguments.poscar,
+            output=arguments.output,
+            variants=parse_potcar_variants(arguments.variants),
+        )
     elif command == "vasp-nbands":
         print(
             calculate_nbands(
@@ -285,6 +295,8 @@ def run_command(arguments: argparse.Namespace) -> int:
             termination_grace=arguments.grace,
             report_path=arguments.report,
             dispatch=arguments.dispatch,
+            policy=arguments.policy,
+            checkers=read_checker_specs(arguments.checker, base=Path.cwd()),
         )
         return {
             "completed": 0,

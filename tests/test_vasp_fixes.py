@@ -25,6 +25,7 @@ from httk.codes.vasp import (
     clean_vasp_outputs,
     derive_seed,
     job_remedy_history_path,
+    parse_potcar_variants,
     plan_vasp_remedy,
     prepare_vasp_inputs,
     rattle_poscar,
@@ -651,3 +652,69 @@ def test_excluded_operations_skip_ladder_steps_and_are_named_when_giving_up(tmp_
 def test_excluded_operations_reject_strings_and_unknown_names(tmp_path: Path, bad: object) -> None:
     with pytest.raises(ValueError, match="excluded_operations"):
         plan_vasp_remedy(_KZ, directory=tmp_path, excluded_operations=bad)  # type: ignore[arg-type]
+
+
+def _potential_library(root: Path) -> Path:
+    library = root / "potentials"
+    for variant in ("Si_sv", "Si", "O"):
+        (library / variant).mkdir(parents=True)
+        (library / variant / "POTCAR").write_text(f"TITEL  = PAW_PBE {variant}\n", encoding="utf-8")
+    (root / "POSCAR").write_text(_POSCAR.replace("Si\n2\n", "Si O\n1 1\n"), encoding="utf-8")
+    return library
+
+
+def test_a_named_variant_overrides_the_suffix_policy_and_is_recorded(tmp_path: Path) -> None:
+    library = _potential_library(tmp_path)
+
+    assembly = assemble_potcar(library, poscar=tmp_path / "POSCAR", output=tmp_path / "POTCAR", variants={"Si": "Si"})
+
+    silicon, oxygen = assembly.choices
+    assert (silicon.variant, silicon.suffix, silicon.override) == ("Si", "", True)
+    assert (oxygen.variant, oxygen.override) == ("O", False)
+    recorded = json.loads(assembly.provenance.read_text(encoding="utf-8"))
+    assert [item["override"] for item in recorded["potentials"]] == [True, False]
+    assert (tmp_path / "POTCAR").read_text(encoding="utf-8") == "TITEL  = PAW_PBE Si\nTITEL  = PAW_PBE O\n"
+
+    (tmp_path / "INCAR").write_text("", encoding="utf-8")
+    prepared = prepare_vasp_inputs(
+        VaspPreparationOptions(pseudopotential_library=library, potcar_variants={"Si": "Si"}), directory=tmp_path
+    )
+    potcar = prepared["potcar"]
+    assert isinstance(potcar, dict)
+    assert potcar["potentials"][0]["variant"] == "Si"
+
+
+def test_a_missing_named_variant_is_an_error_not_a_fallback(tmp_path: Path) -> None:
+    library = _potential_library(tmp_path)
+
+    with pytest.raises(FileNotFoundError, match="'Si_pv' for species 'Si'"):
+        assemble_potcar(library, poscar=tmp_path / "POSCAR", output=tmp_path / "POTCAR", variants={"Si": "Si_pv"})
+    assert not (tmp_path / "POTCAR").exists()
+
+
+def test_potcar_variants_parse_from_the_bash_string_form() -> None:
+    assert parse_potcar_variants("Hf=Hf_pv  Zr=Zr_sv") == {"Hf": "Hf_pv", "Zr": "Zr_sv"}
+    assert parse_potcar_variants(None) == parse_potcar_variants("") == {}
+    assert parse_potcar_variants("H=H.5 Hf=Hf H1=H1.25") == {"H": "H.5", "Hf": "Hf", "H1": "H1.25"}
+    assert parse_potcar_variants("H=H1.25") == {"H": "H1.25"}
+    for bad in ("H=He", "S=Si", "Hf=Zr_sv", "Hf=Hf_pv Hf=Hf_sv", "Hf_pv", "Hf=", {"Hf": "Hf_/../x"}, 3):
+        with pytest.raises(ValueError, match="potcar_variants"):
+            parse_potcar_variants(bad)
+
+
+def test_the_bridge_potcar_command_takes_variants(tmp_path: Path) -> None:
+    from httk.workflow._shell_bridge import _parser
+
+    from httk.codes.vasp._bridge import run_command
+
+    library = _potential_library(tmp_path)
+    output = tmp_path / "POTCAR"
+    poscar = str(tmp_path / "POSCAR")
+
+    run_command(_parser().parse_args(["vasp-potcar", str(library), "--poscar", poscar, "--output", str(output)]))
+    assert output.read_text(encoding="utf-8").startswith("TITEL  = PAW_PBE Si_sv\n")
+    arguments = ["vasp-potcar", str(library), "--poscar", poscar, "--output", str(output), "--variants", "Si=Si"]
+    run_command(_parser().parse_args(arguments))
+    assert output.read_text(encoding="utf-8").startswith("TITEL  = PAW_PBE Si\n")
+    with pytest.raises(ValueError, match="another species"):
+        run_command(_parser().parse_args([*arguments[:-1], "Si=O"]))

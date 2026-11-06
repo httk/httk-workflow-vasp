@@ -101,6 +101,13 @@ states them in full):
   {py:class}`~httk.codes.vasp.PotcarAssembly` naming the variant, source, digest and
   `TITEL` of every chosen potential and writes the same record as
   `POTCAR.provenance.json`.
+- **A species can be pinned to one variant.** `assemble_potcar(..., variants={"Hf": "Hf_pv"})`
+  and {py:class}`~httk.codes.vasp.VaspPreparationOptions` `potcar_variants` override the
+  suffix policy for the named species; a named variant missing from the library is an
+  error, never a fallback, and the provenance marks that choice `override`. The Bash
+  form is `httk_vasp_prepare_potcar LIBRARY --variants "Hf=Hf_pv Zr=Zr_sv"`, and the workspace
+  setting `vasp.potcar_variants` takes the same string (the runners in *workflows-vasp*
+  read it).
 
 ## Bash
 
@@ -177,6 +184,63 @@ name is refused with the alternatives named. `reviewed-v1` is registered by the
 package itself and is the default. A group whose practice differs registers its own
 policy rather than editing the package. {doc}`details` documents the reviewed
 ladder, including its ZHEGV recovery, in full.
+
+## Supervision
+
+{py:func}`~httk.codes.vasp.run_vasp` supervises VASP live, as *httk* v1's checkers
+did. Every OUTCAR, OSZICAR, stdout and stderr line passes the built-in checks of
+{py:data}`~httk.codes.vasp.VASP_CHECKS`: each
+{py:class}`~httk.codes.vasp.VaspCheck` names a diagnostic `code`, the `pattern` it
+matches, a `severity`, and whether a match should `stop` the run. Beside the
+table, `realspace_allocation_too_large` stops a run whose real-space projection
+needs more than 500000 KBytes. A stopped run is classified `diagnosed_stop`, and
+the remedy planner chooses its remedy by the diagnostic code.
+
+A per-code policy changes what a built-in check does: `stop` ends the run,
+`continue` keeps the diagnostic but lets the run go on, and `ignore` drops it
+entirely, so neither the report nor the remedy planner sees it. An unknown code is
+refused. The policy governs the live checks only: the post-run diagnosis of an
+incomplete or nonconverged calculation cannot be waived.
+
+Extra supervision is added beside the built-in checks: in-process `monitors`, or
+v1-style executable `checkers` in any language, given as
+{py:class}`~httk.workflow.codes.CheckerSpec` (in Bash, a
+`httk-workflow-checker-spec` JSON file per `--checker`). A checker reads the
+supervision events as JSON lines on stdin and answers with diagnostics that may
+request a stop; the protocol is section 8 of the *httk-workflow*
+{doc}`httk-workflow:details/httk_v1_migration_guide`. A checker that emits a
+built-in code, say `edddav_zhegv`, gets that code's remedy. Swapping a built-in
+check for your own is `ignore` on its code plus your checker.
+
+```python
+from httk.codes.vasp import run_vasp
+from httk.workflow.codes import CheckerSpec
+
+report = run_vasp(
+    ["vasp_std"],
+    directory=workdir,
+    policy={"lreal_false": "continue", "brmix": "stop"},
+    checkers=(CheckerSpec(("/opt/checks/my_checker.py",)),),
+)
+```
+
+The Bash form takes the policy as a string:
+`httk_vasp_run --policy "lreal_false=continue brmix=stop" --checker my-checker.json -- vasp_std`.
+A checker's command runs from the caller's working directory, so name it by an
+absolute path when that is not the workdir. Inside the run directory a checker
+may follow only VASP's own output files (`OUTCAR`, `OSZICAR`, `vasp.out`,
+`vasp.err`, `REPORT`, `XDATCAR`, `PCDAT`, `EIGENVAL`, `DOSCAR`, `PROCAR`,
+`IBZKPT`, `vasprun.xml`, `ML_LOGFILE`), and they are removed before each run;
+files outside the run directory are followed and never touched. The built-in
+checks read only VASP's own output, not the checkers' sources.
+{py:func}`~httk.codes.vasp.read_checker_specs` reads checkers shipped as job files:
+it loads each named spec file, and turns an `argv` element starting with `./`
+(`./brmix.awk` next to `files/brmix-checker.json`) into the absolute path of that
+file beside the spec, so the checker runs from any workdir; other elements are
+kept as written; `--checker` reads its files the same way.
+The VASP workflow runners take the policy from the job parameter
+`diagnostic_policy`, else from the workspace setting `vasp.diagnostic_policy` in
+its string form; those parameters are documented in *workflows-vasp*.
 
 ## Collect
 
