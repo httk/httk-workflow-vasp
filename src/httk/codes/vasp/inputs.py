@@ -461,7 +461,8 @@ def assemble_potcar(
     potential, and the same record is written next to the POTCAR as
     ``<POTCAR>.provenance.json`` unless *provenance* names another file. A species
     named in *variants* gets exactly that variant directory, never a fallback, and
-    its choice is recorded with ``override`` set.
+    its choice is recorded with ``override`` set. The POTCAR is replaced atomically,
+    so an interrupted assembly never leaves a partial file a rerun would accept.
 
     :param library: Search this pseudopotential library root.
     :param poscar: Read species names from this POSCAR.
@@ -514,7 +515,7 @@ def assemble_potcar(
             )
         )
     destination = Path(output)
-    destination.write_bytes(b"".join(pieces))
+    _write_bytes_atomic(destination, b"".join(pieces))
     record = (
         Path(provenance) if provenance is not None else destination.with_name(f"{destination.name}.provenance.json")
     )
@@ -682,20 +683,43 @@ def _write_text_atomic(path: Path, value: str) -> None:
     """Atomically replace ``path`` with ``value``, keeping an existing file's mode and CRLF line ends."""
 
     try:
-        mode: int | None = stat.S_IMODE(path.stat().st_mode)
         crlf = b"\r\n" in path.read_bytes()
     except FileNotFoundError:
-        mode, crlf = None, False
+        crlf = False
+    _write_bytes_atomic(path, (value.replace("\n", "\r\n") if crlf else value).encode("utf-8"))
+
+
+def _write_bytes_atomic(path: Path, data: bytes) -> None:
+    """Atomically replace ``path`` with ``data``, keeping an existing file's mode (else the umask default)."""
+
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        mode = 0o666 & ~_umask()
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
     try:
-        if mode is not None:
-            os.fchmod(descriptor, mode)
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\r\n" if crlf else "\n") as stream:
-            stream.write(value)
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _umask() -> int:
+    """Return the process umask."""
+
+    # /proc reads it without the os.umask set-and-restore round trip, which races other threads.
+    try:
+        for line in Path("/proc/self/status").read_text(encoding="ascii").splitlines():
+            if line.startswith("Umask:"):
+                return int(line.split()[1], 8)
+    except OSError:
+        pass
+    current = os.umask(0o077)
+    os.umask(current)
+    return current
 
 
 def calculate_nbands(

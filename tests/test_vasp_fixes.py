@@ -8,6 +8,8 @@ and a policy that could not be extended without editing the module.
 """
 
 import json
+import os
+import stat
 import sys
 from pathlib import Path
 
@@ -690,6 +692,33 @@ def test_a_missing_named_variant_is_an_error_not_a_fallback(tmp_path: Path) -> N
     with pytest.raises(FileNotFoundError, match="'Si_pv' for species 'Si'"):
         assemble_potcar(library, poscar=tmp_path / "POSCAR", output=tmp_path / "POTCAR", variants={"Si": "Si_pv"})
     assert not (tmp_path / "POTCAR").exists()
+
+
+def test_potcar_is_written_atomically_so_a_rerun_never_accepts_a_partial_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Runners skip assembly when POTCAR exists, so it must be absent or complete.
+    library = _potential_library(tmp_path)
+    potcar = tmp_path / "POTCAR"
+
+    def interrupted(*_: object) -> None:
+        raise OSError("killed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("httk.codes.vasp.inputs.os.replace", interrupted)
+        with pytest.raises(OSError, match="killed"):
+            assemble_potcar(library, poscar=tmp_path / "POSCAR", output=potcar)
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["POSCAR", "potentials"]
+
+    previous = os.umask(0o027)
+    try:
+        assemble_potcar(library, poscar=tmp_path / "POSCAR", output=potcar)
+    finally:
+        os.umask(previous)
+    assert potcar.read_bytes() == b"TITEL  = PAW_PBE Si_sv\nTITEL  = PAW_PBE O\n"
+    # A new POTCAR gets the umask default, as a plain write would, not mkstemp's 0600.
+    assert stat.S_IMODE(potcar.stat().st_mode) == 0o640
+    assert {path.name for path in tmp_path.iterdir()} == {"POSCAR", "POTCAR", "POTCAR.provenance.json", "potentials"}
 
 
 def test_potcar_variants_parse_from_the_bash_string_form() -> None:
