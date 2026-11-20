@@ -22,6 +22,8 @@ def _isolated_httk_config(tmp_path_factory: pytest.TempPathFactory, monkeypatch:
     for variable in (
         "HTTK_WORKFLOW_CONTEXT",
         "HTTK_WORKFLOW_JOB_DIR",
+        "HTTK_WORKFLOW_STOP_WARNING",
+        "HTTK_WORKFLOW_DEADLINE",
         "HTTK_VASP_PARALLELIZATION",
         "HTTK_VASP_NBANDS_ROUNDING",
         "HTTK_VASP_NCL_COMMAND",

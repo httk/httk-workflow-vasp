@@ -1,9 +1,12 @@
 """The VASP remedy, cleanup and diagnostic helpers, moved from httk-workflow's Bash API tests."""
 
 import json
+import subprocess
 import sys
+import time
 from pathlib import Path
 
+import pytest
 from httk.workflow.supervision import Diagnostic
 
 from httk.codes.vasp import (
@@ -141,3 +144,40 @@ Path("OUTCAR").write_text("vasp.6.4\\nGeneral timing and accounting informations
     assert report.classification == "completed", report.diagnostics
     assert report.process.returncode == 0
     assert (tmp_path / "CONTCAR").read_text(encoding="utf-8") == "kept\n"
+
+
+def test_the_bridge_runs_a_soft_stop_and_prints_its_mintime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from httk.workflow._shell_bridge import _parser
+
+    from httk.codes.vasp._bridge import run_command
+
+    _poscar(tmp_path / "POSCAR")
+    monkeypatch.setenv("HTTK_MOCK_VASP_IONIC_STEPS", "20")
+    monkeypatch.setenv("HTTK_MOCK_VASP_STEP_SECONDS", "0.2")
+    monkeypatch.setenv("HTTK_WORKFLOW_STOP_WARNING", str(int(time.time()) - 1))
+    monkeypatch.setenv("HTTK_WORKFLOW_DEADLINE", str(int(time.time()) + 600))
+    mock = str(Path(__file__).with_name("mock_vasp.py"))
+    arguments = ["vasp-run", "--directory", str(tmp_path), "--no-dispatch", "--soft-stop", "ionic"]
+    assert run_command(_parser().parse_args([*arguments, "--", sys.executable, mock])) == 23
+    report = json.loads((tmp_path / "vasp-run-report.json").read_text(encoding="utf-8"))
+    assert (report["classification"], report["soft_stop"]["mode"]) == ("stopped", "ionic")
+
+    capsys.readouterr()
+    monkeypatch.chdir(tmp_path)
+    assert run_command(_parser().parse_args(["vasp-soft-stop-mintime"])) == 0
+    # Twice the lead to a deadline at most 600 s after the request; generous slack for a loaded host.
+    hours, minutes, seconds = (int(item) for item in capsys.readouterr().out.strip().split(":"))
+    assert minutes < 60 and seconds < 60 and 2 * (600 - 300) <= (hours * 60 + minutes) * 60 + seconds <= 2 * 600
+    report["classification"] = "completed"
+    (tmp_path / "other.json").write_text(json.dumps(report), encoding="utf-8")
+    assert run_command(_parser().parse_args(["vasp-soft-stop-mintime", "other.json"])) == 1
+    assert capsys.readouterr().out == ""
+
+
+def test_the_bash_soft_stop_mintime_wrapper_passes_through(tmp_path: Path) -> None:
+    api = Path(__file__).parents[1] / "src" / "httk" / "codes" / "vasp" / "httk-vasp.sh"
+    script = '_httk_workflow_bridge() { printf "%s\\n" "$*"; }; source "$1"; httk_vasp_soft_stop_mintime r.json'
+    result = subprocess.run(["bash", "-c", script, "bash", str(api)], capture_output=True, text=True, check=False)
+    assert (result.returncode, result.stdout) == (0, "vasp-soft-stop-mintime r.json\n"), result.stderr

@@ -7,10 +7,13 @@ classified :class:`VaspRunReport`. Historical authorship is documented in
 ``v1_runtime/NOTICE``.
 """
 
+import logging
+import math
 import os
 import re
 import shlex
 import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -27,7 +30,19 @@ from httk.workflow.codes import (
     write_json_atomic,
 )
 
-from .diagnostics import _ALLOCATION_CODE, VASP_CHECKS, VaspCheck, diagnose_vasp_files, parse_diagnostic_policy
+from .diagnostics import (
+    _ALLOCATION_CODE,
+    _ELECTRONIC_STEP,
+    _IONIC_STEP,
+    _NSW,
+    VASP_CHECKS,
+    VaspCheck,
+    diagnose_vasp_files,
+    parse_diagnostic_policy,
+)
+from .inputs import _write_text_atomic
+
+_LOGGER = logging.getLogger(__name__)
 
 #: The event sources of VASP's own output: the two followed files and the process streams.
 _VASP_SOURCES = frozenset({"OUTCAR", "OSZICAR", "stdout", "stderr"})
@@ -47,6 +62,10 @@ _FOLLOWABLE_OUTPUTS = (
     "vasprun.xml",
     "ML_LOGFILE",
 )
+#: The STOPCAR each ``soft_stop`` mode writes.
+_STOPCARS = {"ionic": "LSTOP = .TRUE.\n", "electronic": "LABORT = .TRUE.\n"}
+#: How much of the end of OUTCAR and ``vasp.out`` is searched for VASP's stop and convergence messages.
+_TAIL_BYTES = 1 << 20
 
 
 def _checker_source_problem(path: Path) -> str | None:
@@ -100,6 +119,107 @@ class _VaspMonitor:
         ]
 
 
+class _SoftStop:
+    """Write the STOPCAR of *mode* once, when the clock reaches the stop time.
+
+    The stop time is the earliest of *stop_warning* and, once a step has completed,
+    *deadline* less three average steps (custodian's ``WalltimeHandler`` rule).
+    """
+
+    def __init__(
+        self,
+        mode: str,
+        directory: Path,
+        stop_warning: float | None,
+        deadline: float | None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self.path = directory / "STOPCAR"
+        self.content = _STOPCARS[mode]
+        self.step = _IONIC_STEP if mode == "ionic" else _ELECTRONIC_STEP
+        self.stop_warning = stop_warning
+        self.deadline = deadline
+        self.clock = clock
+        self.started: float | None = None
+        self.steps = 0
+        self.last_step = 0.0
+        self.requested_at: float | None = None
+        self.done = False
+
+    def __call__(self, event: SourceEvent) -> Sequence[Diagnostic]:
+        now = self.clock()
+        if self.started is None:
+            self.started = now
+        if self.done:
+            return ()
+        if event.event == "line" and event.source == "OSZICAR" and event.line and self.step.match(event.line):
+            self.steps += 1
+            self.last_step = now
+        times = [] if self.stop_warning is None else [self.stop_warning]
+        if self.deadline is not None and self.steps:
+            times.append(self.deadline - 3 * (self.last_step - self.started) / self.steps)
+        if times and now >= min(times):
+            self.done = True
+            try:
+                _write_text_atomic(self.path, self.content)
+            except OSError as exc:
+                # A monitor exception would stop VASP as monitor_error: the run outlives a failed soft stop.
+                _LOGGER.warning("could not write %s, VASP runs on to the deadline: %s", self.path, exc)
+            else:
+                self.requested_at = now
+        return ()
+
+
+def _environment_time(value: float | None, variable: str) -> float | None:
+    """Return *value*, else the epoch second in the environment *variable*, else ``None``."""
+
+    if value is not None:
+        return value
+    try:
+        found = float(os.environ[variable])
+    except (KeyError, ValueError):
+        return None
+    return found if math.isfinite(found) else None
+
+
+def _tail(path: Path) -> str:
+    """Return the lowercased last :data:`_TAIL_BYTES` of *path*, or ``""`` when it is not a file."""
+
+    # ponytail: a bounded tail, since an OUTCAR can be hundreds of MB; VASP prints these messages
+    # just before the footer, so only more than 1 MiB of output after them would hide them.
+    if not path.is_file():
+        return ""
+    with path.open("rb") as stream:
+        stream.seek(max(0, stream.seek(0, os.SEEK_END) - _TAIL_BYTES))
+        return stream.read().decode("utf-8", errors="replace").lower()
+
+
+def _stop_acknowledgement(root: Path) -> str | None:
+    """Return ``"hard"`` or ``"soft"`` when VASP's OUTCAR or captured stdout acknowledges a STOPCAR."""
+
+    tails = (_tail(root / "OUTCAR"), _tail(root / "vasp.out"))
+    if any("hard stop encountered" in text for text in tails):
+        return "hard"
+    if any("soft stop encountered" in text for text in tails):
+        return "soft"
+    return None
+
+
+def _soft_stop_ended_early(root: Path) -> bool:
+    """Return whether a soft-stopped relaxation ended before ``NSW`` ionic steps without converging."""
+
+    outcar, oszicar = root / "OUTCAR", root / "OSZICAR"
+    nsw = None
+    if outcar.is_file():
+        # Streamed to the header's first NSW echo, whatever precedes it.
+        with outcar.open(encoding="utf-8", errors="replace") as stream:
+            nsw = next((int(match.group(1)) for line in stream if (match := _NSW.match(line))), None)
+    if nsw is None or nsw <= 1 or "reached required accuracy" in _tail(outcar):
+        return False
+    lines = oszicar.read_text(encoding="utf-8", errors="replace").splitlines() if oszicar.is_file() else []
+    return sum(1 for line in lines if _IONIC_STEP.match(line)) < nsw
+
+
 @dataclass(frozen=True)
 class VaspRunReport:
     """Classified result of one supervised VASP execution.
@@ -108,12 +228,17 @@ class VaspRunReport:
     :param classification: Record the final VASP run classification.
     :param diagnostics: Preserve live and file-level diagnostics.
     :param diagnostic_policy: Record the policy applied to the live checks, by diagnostic code.
+    :param soft_stop: Record the soft stop: its ``mode`` (``"ionic"``, ``"electronic"`` or ``None``),
+        ``requested_at`` (the epoch second the STOPCAR was written, else ``None``), ``lead_seconds``
+        (the deadline less ``requested_at`` when both are known, else ``None``) and ``acknowledged``
+        (``"soft"`` or ``"hard"`` when VASP's output reports a STOPCAR stop, else ``None``).
     """
 
     process: ProcessReport
     classification: str
     diagnostics: tuple[Diagnostic, ...]
     diagnostic_policy: Mapping[str, str] = field(default_factory=dict)
+    soft_stop: Mapping[str, object] = field(default_factory=dict)
 
     def as_mapping(self) -> dict[str, object]:
         """Serialize the report for JSON storage.
@@ -127,6 +252,7 @@ class VaspRunReport:
             "classification": self.classification,
             "diagnostics": [item.as_mapping() for item in self.diagnostics],
             "diagnostic_policy": dict(self.diagnostic_policy),
+            "soft_stop": dict(self.soft_stop),
         }
 
     def write(self, path: str | os.PathLike[str]) -> Path:
@@ -153,6 +279,9 @@ def run_vasp(
     policy: Mapping[str, str] | str | None = None,
     monitors: Sequence[Callable[[SourceEvent], Sequence[Diagnostic]]] = (),
     checkers: Sequence[CheckerSpec] = (),
+    soft_stop: str | None = None,
+    stop_warning: float | None = None,
+    deadline: float | None = None,
 ) -> VaspRunReport:
     """Run VASP with live VASP-5/6 diagnostics and a structured report.
 
@@ -164,12 +293,26 @@ def run_vasp(
     writes the planned ``KPAR``/``NCORE`` into ``INCAR`` and applies the launch
     prefix. The followed ``OUTCAR`` and ``OSZICAR`` are removed before VASP
     starts, so a stale file from an earlier run cannot replay its diagnostics into
-    this one; VASP rewrites both anyway. ``CONTCAR`` and the run report are not touched.
+    this one; VASP rewrites both anyway. A ``STOPCAR`` is removed before VASP starts
+    and again after it ends, whatever *soft_stop*, since a stale one would stop the
+    next run at once. ``CONTCAR`` and the run report are not touched.
 
     Live supervision applies *checks* to every followed line, adjusted by
     *policy*, then the extra *monitors* and *checkers*; any diagnostic with
     ``stop`` set ends the run as ``diagnosed_stop``. A monitor or checker that
     emits a built-in code gets that code's remedy from the remedy planner.
+
+    With *soft_stop* set, a monitor writes the mode's ``STOPCAR`` once, when the
+    clock reaches the earliest of *stop_warning* and, once a step has completed,
+    *deadline* less three average steps (ionic steps for ``"ionic"``, electronic
+    steps for ``"electronic"``); with neither time known it never writes one.
+    VASP then ends cleanly with exit status 0. A run whose ``OUTCAR`` or ``vasp.out``
+    acknowledges a STOPCAR, whoever wrote it, is classified ``stopped`` instead
+    of ``nonconverged`` or a missing-footer ``process_failure``: always for
+    ``hard stop encountered`` (``LABORT``), and for ``soft stop encountered``
+    (``LSTOP``) only when ``NSW`` exceeds 1, fewer than ``NSW`` ionic steps
+    completed and ``reached required accuracy`` is absent. A timeout, a stop
+    diagnostic or a nonzero exit status keeps its own classification.
 
     :param argv: Execute this VASP command argument vector, naming the program (for example ``["vasp_std"]``).
         The attempt's launch prefix (``HTTK_WORKFLOW_LAUNCH``) is prepended by default; a command that already
@@ -194,15 +337,28 @@ def run_vasp(
         and they are removed before each run; files outside it are followed and never touched. A checker's
         ``argv`` runs unchanged from the caller's working directory (the job workdir for a workflow runner),
         so name it by an absolute path otherwise.
+    :param soft_stop: Write a STOPCAR before the deadline: ``"ionic"`` writes ``LSTOP = .TRUE.`` (VASP stops
+        after the current ionic step, for a relaxation that resumes from ``CONTCAR``), ``"electronic"``
+        writes ``LABORT = .TRUE.`` (VASP stops after the current electronic step); ``None``, the default,
+        never writes one.
+    :param stop_warning: Write the STOPCAR from this epoch second at the latest; ``None`` reads
+        ``HTTK_WORKFLOW_STOP_WARNING``. Used only with *soft_stop*.
+    :param deadline: The epoch second the attempt is stopped at; ``None`` reads ``HTTK_WORKFLOW_DEADLINE``.
+        Used only with *soft_stop*.
     :return: The classified VASP run report; its ``process.argv`` is the wrapper command line when dispatching.
     :raises ValueError: If a command, or a configured ``vasp.ncl_command``/``vasp.gamma_command``,
         starts with a launcher while a launch prefix applies, if *policy* is invalid, or if a checker
-        follows another file inside the run directory, or one there that is a symlink or not a regular file.
+        follows another file inside the run directory, or one there that is a symlink or not a regular file,
+        if *soft_stop* is not ``None``, ``"ionic"`` or ``"electronic"``, or if ``STOPCAR`` is a symlink or
+        not a regular file.
     """
 
     # Parsed first: an invalid policy must not touch the workdir.
     diagnostic_policy = parse_diagnostic_policy(policy, checks=checks)
+    if soft_stop is not None and soft_stop not in _STOPCARS:
+        raise ValueError(f"soft_stop must be None, 'ionic' or 'electronic', not {soft_stop!r}")
     root = Path(directory).resolve()
+    stopcar = root / "STOPCAR"
     follow = [FollowSource(root / "OSZICAR", "OSZICAR"), FollowSource(root / "OUTCAR", "OUTCAR")]
     # Everything is checked before anything is removed, lexically: a symlink is never followed for deletion.
     for checker in checkers:
@@ -215,10 +371,13 @@ def run_vasp(
                 raise ValueError(f"checker source {path} is not a regular file; it would be removed before the run")
             if path not in {item.path for item in follow}:
                 follow.append(replace(source, path=path))
+    if stopcar.is_symlink() or (stopcar.exists() and not stopcar.is_file()):
+        raise ValueError(f"{stopcar} is not a regular file; it would be removed before the run")
     # A stale source would replay the previous run into the checks; one outside the run directory is not ours.
     for source in follow:
         if source.path.is_relative_to(root):
             source.path.unlink(missing_ok=True)
+    stopcar.unlink(missing_ok=True)
     # Refuses a leading launcher before anything starts, with or without the wrapper.
     command = launch_command(argv, launch=launch is not False)
     if dispatch:
@@ -247,8 +406,14 @@ def run_vasp(
             command.append(f"--gamma={variants['vasp.gamma_command']}")
         if launch is False:
             command.append("--no-launch")
+    stopper = None
+    if soft_stop is not None:
+        deadline = _environment_time(deadline, "HTTK_WORKFLOW_DEADLINE")
+        stopper = _SoftStop(soft_stop, root, _environment_time(stop_warning, "HTTK_WORKFLOW_STOP_WARNING"), deadline)
     supervisor = ProcessSupervisor(
-        monitors=(_VaspMonitor(checks, diagnostic_policy), *monitors), checkers=checkers, follow=follow
+        monitors=(_VaspMonitor(checks, diagnostic_policy), *monitors, *(() if stopper is None else (stopper,))),
+        checkers=checkers,
+        follow=follow,
     )
     process = supervisor.run(
         command,
@@ -258,13 +423,17 @@ def run_vasp(
         stdout_path=root / "vasp.out",
         stderr_path=root / "vasp.err",
     )
+    stopcar.unlink(missing_ok=True)
     diagnostics = _deduplicate((*process.diagnostics, *diagnose_vasp_files(root)))
+    acknowledged = _stop_acknowledgement(root)
     if process.timed_out:
         classification = "timeout"
     elif any(item.stop for item in diagnostics):
         classification = "diagnosed_stop"
     elif process.returncode:
         classification = "process_failure"
+    elif acknowledged == "hard" or (acknowledged == "soft" and _soft_stop_ended_early(root)):
+        classification = "stopped"
     elif any(
         item.code in {"electronic_nonconvergence", "ionic_nonconvergence", "positive_final_energy"}
         for item in diagnostics
@@ -274,9 +443,36 @@ def run_vasp(
         classification = "process_failure"
     else:
         classification = "completed"
-    report = VaspRunReport(process, classification, diagnostics, diagnostic_policy)
+    requested_at = None if stopper is None else stopper.requested_at
+    lead = None if requested_at is None or deadline is None else deadline - requested_at
+    record = {"mode": soft_stop, "requested_at": requested_at, "lead_seconds": lead, "acknowledged": acknowledged}
+    report = VaspRunReport(process, classification, diagnostics, diagnostic_policy, record)
     report.write(root / report_path)
     return report
+
+
+def soft_stop_mintime(report: VaspRunReport) -> str | None:
+    """Return the ``mintime`` to resume a soft-stopped run with.
+
+    It is twice the report's ``lead_seconds``, rounded up to whole seconds and at
+    least one minute, so a manager about to drain does not start the resumed run.
+
+    :param report: Read this run report.
+    :return: The Slurm duration ``H:MM:SS``, or ``None`` when the run was not ``stopped``
+        or its lead is unknown.
+    """
+
+    return _mintime(report.classification, report.soft_stop)
+
+
+def _mintime(classification: object, soft_stop: object) -> str | None:
+    """Return :func:`soft_stop_mintime` of a classification and a ``soft_stop`` member read from JSON."""
+
+    lead = soft_stop.get("lead_seconds") if isinstance(soft_stop, Mapping) else None
+    if classification != "stopped" or not isinstance(lead, int | float) or isinstance(lead, bool):
+        return None
+    seconds = max(60, math.ceil(2 * lead))
+    return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
 
 def read_checker_specs(value: object, *, base: str | os.PathLike[str]) -> tuple[CheckerSpec, ...]:

@@ -277,6 +277,10 @@ _POLICY_ACTIONS = frozenset({"stop", "continue", "ignore"})
 _POST_RUN_CODES = frozenset(
     {"incomplete_outcar", "electronic_nonconvergence", "ionic_nonconvergence", "positive_final_energy"}
 )
+#: OUTCAR's echoed ``NSW``, and the OSZICAR lines of one electronic and one completed ionic step.
+_NSW = re.compile(r"^\s*NSW\s*=\s*([0-9]+)", re.MULTILINE)
+_ELECTRONIC_STEP = re.compile(r"^[A-Za-z]+:\s+([0-9]+)\s+")
+_IONIC_STEP = re.compile(r"^\s*[0-9]+\s+F=\s*([-+0-9.Ee]+)")
 
 
 def parse_diagnostic_policy(value: object, *, checks: Sequence[VaspCheck] = VASP_CHECKS) -> dict[str, str]:
@@ -353,7 +357,7 @@ def diagnose_vasp_files(directory: str | os.PathLike[str] = ".") -> tuple[Diagno
     ):
         diagnostics.append(Diagnostic("incomplete_outcar", "error", "OUTCAR has no normal completion footer", "OUTCAR"))
     nelm_match = re.search(r"^\s*NELM\s*=\s*([0-9]+)", outcar_text, re.MULTILINE)
-    nsw_match = re.search(r"^\s*NSW\s*=\s*([0-9]+)", outcar_text, re.MULTILINE)
+    nsw_match = _NSW.search(outcar_text)
     nelm = None if nelm_match is None else int(nelm_match.group(1))
     nsw = None if nsw_match is None else int(nsw_match.group(1))
     if oszicar.is_file():
@@ -361,10 +365,10 @@ def diagnose_vasp_files(directory: str | os.PathLike[str] = ".") -> tuple[Diagno
         ionic_steps = 0
         last_energy: float | None = None
         for line in oszicar.read_text(encoding="utf-8", errors="replace").splitlines():
-            match = re.match(r"^[A-Za-z]+:\s+([0-9]+)\s+", line)
+            match = _ELECTRONIC_STEP.match(line)
             if match:
                 electronic_step = int(match.group(1))
-            ionic = re.match(r"^\s*[0-9]+\s+F=\s*([-+0-9.Ee]+)", line)
+            ionic = _IONIC_STEP.match(line)
             if ionic:
                 ionic_steps += 1
                 last_energy = float(ionic.group(1))

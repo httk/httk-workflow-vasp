@@ -26,7 +26,15 @@
 # Version 4 adds httk_vasp_unset_tag TAG [path=INCAR], which removes every
 # assignment of TAG so VASP uses its own default; an absent TAG is no error and
 # leaves the file untouched. httk_vasp_set_tag TAG null still writes "null".
-HTTK_VASP_BASH_API_VERSION=4
+#
+# Version 5 adds httk_vasp_run --soft-stop ionic|electronic, which writes a
+# STOPCAR (LSTOP or LABORT) shortly before the attempt's deadline, taken from
+# HTTK_WORKFLOW_STOP_WARNING and HTTK_WORKFLOW_DEADLINE. httk_vasp_run exits 0
+# (completed), 20 (diagnosed stop), 21 (nonconverged), 22 (process failure),
+# 23 (stopped by a STOPCAR, resumable) or 124 (timeout). It also adds
+# httk_vasp_soft_stop_mintime [REPORT=vasp-run-report.json], which prints the
+# mintime to resume a stopped run with, or exits 1 with no output when there is none.
+HTTK_VASP_BASH_API_VERSION=5
 
 _httk_vasp_require_workflow_api() {
     if ! declare -F _httk_workflow_bridge >/dev/null 2>&1; then
@@ -128,6 +136,11 @@ httk_vasp_rattle_poscar() {
 httk_vasp_run() {
     _httk_vasp_require_workflow_api || return
     _httk_workflow_bridge vasp-run "$@"
+}
+
+httk_vasp_soft_stop_mintime() {
+    _httk_vasp_require_workflow_api || return
+    _httk_workflow_bridge vasp-soft-stop-mintime "$@"
 }
 
 httk_vasp_diagnose() {

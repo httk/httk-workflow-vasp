@@ -17,9 +17,18 @@ Use it exactly the way a deployment names the real thing:
 ``HTTK_MOCK_VASP_FAIL_ONCE=1`` makes the first run in a directory fail with a
 diagnosable ``ZPOTRF`` error instead, which is what makes the runners' remedy
 ladder visible: the job applies one reviewed remedy and the rerun succeeds.
+
+``HTTK_MOCK_VASP_IONIC_STEPS=N`` runs N ionic steps of two electronic steps each
+instead (``NSW`` stays 99), sleeping ``HTTK_MOCK_VASP_STEP_SECONDS`` (default
+0.1) per ionic step and appending OSZICAR lines as it goes. Like VASP it honours
+a ``STOPCAR``: ``LSTOP = .TRUE.`` stops after the current ionic step and
+``LABORT = .TRUE.`` after the current electronic step, each announced on stdout
+and in the OUTCAR, and the run then finishes normally with exit status 0.
 """
 
 import os
+import sys
+import time
 from pathlib import Path
 
 _OUTCAR = (
@@ -59,6 +68,41 @@ _VASPRUN = (
 )
 
 
+def _stopcar(tag: str) -> bool:
+    path = Path("STOPCAR")
+    return path.is_file() and f"{tag} = .TRUE." in path.read_text(encoding="utf-8")
+
+
+def _stepping(steps: int, pause: float) -> None:
+    """Run *steps* ionic steps, stopping early on a STOPCAR."""
+
+    header = _OUTCAR.split("   FREE ENERGIE")[0]
+    with open("OUTCAR", "w", encoding="utf-8") as outcar, open("OSZICAR", "w", encoding="utf-8") as oszicar:
+        outcar.write(header)
+        stop = None
+        for ionic in range(1, steps + 1):
+            for electronic in (1, 2):
+                time.sleep(pause / 2)
+                oszicar.write(f"DAV: {electronic:3d}    -0.100000000000E+02   -0.10000E+02   -0.30000E+01   128\n")
+                oszicar.flush()
+                if _stopcar("LABORT"):
+                    stop = "hard"
+                    break
+            if stop is None:
+                energy = -10.0 - ionic / 100
+                oszicar.write(f"{ionic:4d} F= {energy:.8E} E0= {energy:.8E}  d E =-.1E-02\n")
+                oszicar.flush()
+                outcar.write(f"   free  energy   TOTEN  =       {energy:.8f} eV\n")
+                if _stopcar("LSTOP"):
+                    stop = "soft"
+            if stop is not None:
+                message = f"{stop} stop encountered!  aborting job ...\n"
+                sys.stdout.write(message)
+                outcar.write(message)
+                break
+        outcar.write(" General timing and accounting informations for this job:\n")
+
+
 def main() -> int:
     """Write one mock VASP result, or fail once when asked to."""
 
@@ -73,8 +117,13 @@ def main() -> int:
         Path("OUTCAR").write_text(" fake vasp 6.4.1\n   NELM   =     60\n   NSW    =     99\n", encoding="utf-8")
         Path("OSZICAR").write_text("DAV:   1    -0.100000000000E+02\n", encoding="utf-8")
         return 1
-    Path("OUTCAR").write_text(_OUTCAR, encoding="utf-8")
-    Path("OSZICAR").write_text(_OSZICAR, encoding="utf-8")
+    if "HTTK_MOCK_VASP_IONIC_STEPS" in os.environ:
+        _stepping(
+            int(os.environ["HTTK_MOCK_VASP_IONIC_STEPS"]), float(os.environ.get("HTTK_MOCK_VASP_STEP_SECONDS", "0.1"))
+        )
+    else:
+        Path("OUTCAR").write_text(_OUTCAR, encoding="utf-8")
+        Path("OSZICAR").write_text(_OSZICAR, encoding="utf-8")
     relaxed = list(structure)
     relaxed[0] = "relaxed by the mock vasp"
     relaxed[-1] = "0.5100000000 0.5100000000 0.5100000000"

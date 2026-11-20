@@ -3,13 +3,17 @@
 import bz2
 from pathlib import Path
 
+from httk.workflow.codes import ProcessReport
+
 from httk.codes.vasp import (
+    VaspRunReport,
     assemble_potcar,
     automatic_kpoint_grid,
     contcar_to_poscar,
     last_oszicar_energy,
     read_incar,
     read_poscar_header,
+    soft_stop_mintime,
     suggested_magnetic_moments,
     update_incar,
     write_automatic_kpoints,
@@ -107,3 +111,34 @@ def test_a_none_value_removes_every_assignment_of_its_tag(tmp_path: Path) -> Non
     incar.write_text("NBANDS = 64  # httk: rounded from 61 for NPAR 8\nISYM = 0 # httk: rounded from 1 for NPAR 2\n")
     update_incar({"NBANDS": 66, "ISYM": 2}, incar)
     assert incar.read_text(encoding="utf-8") == "ISYM = 2\nNBANDS = 66\n"
+
+
+def test_contcar_promotion_is_atomic_and_unchanged(tmp_path: Path) -> None:
+    poscar = tmp_path / "POSCAR"
+    _poscar(poscar, comment="original")
+    contcar = tmp_path / "CONTCAR"
+    _poscar(contcar, comment="relaxed")
+    contcar.write_bytes(contcar.read_bytes().replace(b"\n", b"\r\n"))
+    # As before, the promoted text is LF throughout, even onto a CRLF POSCAR.
+    poscar.write_bytes(poscar.read_bytes().replace(b"\n", b"\r\n"))
+    expected = b"original\n" + contcar.read_bytes().split(b"\r\n", 1)[1].replace(b"\r\n", b"\n")
+    poscar.chmod(0o640)
+    # Promoted onto its own reference, as a restart does.
+    assert contcar_to_poscar(contcar, reference=poscar, output=poscar) == poscar
+    assert poscar.read_bytes() == expected
+    assert poscar.stat().st_mode & 0o777 == 0o640
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["CONTCAR", "POSCAR"]
+
+
+def test_soft_stop_mintime_doubles_the_lead() -> None:
+    process = ProcessReport(("vasp_std",), "", "", 0, "exit", b"", b"", ())
+
+    def mintime(classification: str, lead: object) -> str | None:
+        return soft_stop_mintime(VaspRunReport(process, classification, (), {}, {"lead_seconds": lead}))
+
+    assert mintime("stopped", 300.2) == "0:10:01"
+    assert mintime("stopped", 5.0) == "0:01:00"
+    assert mintime("stopped", 7300) == "4:03:20"
+    assert mintime("stopped", None) is None
+    assert mintime("completed", 300.0) is None
+    assert soft_stop_mintime(VaspRunReport(process, "stopped", ())) is None

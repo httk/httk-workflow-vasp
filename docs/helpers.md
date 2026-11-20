@@ -52,7 +52,9 @@ The package covers:
 - **Execution and diagnosis** — {py:func}`~httk.codes.vasp.run_vasp` supervises
   one VASP process and returns a classified
   {py:class}`~httk.codes.vasp.VaspRunReport`, removing a stale `OUTCAR` and
-  `OSZICAR` first so an earlier run's errors cannot stop the new one;
+  `OSZICAR` first so an earlier run's errors cannot stop the new one, and a
+  `STOPCAR` before and after every run so it cannot stop the next one
+  (see [Soft stop](#soft-stop));
   {py:func}`~httk.codes.vasp.diagnose_vasp_files` reads VASP 5 and 6 output into
   structured diagnostics without changing inputs;
   {py:func}`~httk.codes.vasp.validate_vasp_workdir` checks VASP's conservative
@@ -133,7 +135,8 @@ removes a tag so VASP uses its default, and succeeds when it is absent) and
 preparation no longer applies; without an INCAR `MAGMOM` it reads the POSCAR
 comment's `[MAGMOM=...]`, else VASP's 1 per ion); `run`,
 `diagnose` and `report_problems` (which prints the distinct non-warning diagnostic
-codes of a run report, one per line); `remedy_plan`, `remedy_apply` and
+codes of a run report, one per line); `soft_stop_mintime` (which prints the
+`mintime` to resume a soft-stopped run with, see [Soft stop](#soft-stop)); `remedy_plan`, `remedy_apply` and
 `remedy_reapply` (which prints the replayed changes as JSON); `preclean`,
 `clean_outcar`, `normalize_poscar`,
 `scale_poscar`, `rattle_poscar`, `promote_contcar`, and the energy, volume, POTIM,
@@ -142,7 +145,8 @@ every option of that command is available because arguments pass through
 untouched. A legitimately absent answer, such as an INCAR tag that is not set,
 exits `1`; a refused call exits `2` with the reason on stderr. `httk_vasp_run` and
 `httk_vasp_diagnose` exit `20` on a structured diagnostic stop, `httk_vasp_run`
-exits `21` when the calculation completed without converging, and
+exits `21` when the calculation completed without converging, `22` on a process
+failure, `23` when a `STOPCAR` stopped it (`stopped`) and `124` on a timeout, and
 `httk_vasp_remedy_plan` exits `3` when the policy has no safe action left. A
 complete Bash VASP runner is `vasp.relax-bash` of workflows-vasp.
 
@@ -241,6 +245,65 @@ kept as written; `--checker` reads its files the same way.
 The VASP workflow runners take the policy from the job parameter
 `diagnostic_policy`, else from the workspace setting `vasp.diagnostic_policy` in
 its string form; those parameters are documented in *workflows-vasp*.
+
+## Soft stop
+
+A workflow manager stops a running attempt shortly before its allocation ends,
+and the attempt then restarts from its inputs; a VASP relaxation loses every
+ionic step it made. With `soft_stop` set, {py:func}`~httk.codes.vasp.run_vasp`
+writes a `STOPCAR` a little earlier instead, so VASP ends cleanly and the
+workflow can continue from what it wrote:
+
+- `soft_stop="ionic"` writes `LSTOP = .TRUE.`: VASP stops after the current ionic
+  step. Use it for relaxations, which resume from the `CONTCAR`.
+- `soft_stop="electronic"` writes `LABORT = .TRUE.`: VASP stops after the current
+  electronic step. Use it for a long SCF that writes a `WAVECAR`, which resumes
+  with `ISTART = 1`.
+
+The times come from the attempt. `stop_warning` defaults to
+`HTTK_WORKFLOW_STOP_WARNING`, which the manager sets from the step's `warntime`
+resource (for example `[workflow.steps.run.resources] warntime = "5:00"`) as that
+long before the deadline, and `deadline` defaults to `HTTK_WORKFLOW_DEADLINE`.
+The `STOPCAR` is written once, when the clock reaches the earlier of
+`stop_warning` and, once a step has completed, the deadline less three average
+steps (ionic steps for `ionic`, electronic steps for `electronic`, read from
+`OSZICAR` as it grows). This is custodian's `WalltimeHandler` rule with the
+declared `warntime` as the floor. **Without a known stop warning or deadline,
+nothing is ever written**, so a run outside a workflow attempt, or in an attempt
+with neither `maxtime` nor a known allocation end, is not affected.
+
+A run that VASP's `OUTCAR` or captured `vasp.out` reports as stopped by a
+`STOPCAR`, whoever wrote it, is classified `stopped`:
+
+- `hard stop encountered` (`LABORT`) is always `stopped`;
+- `soft stop encountered` (`LSTOP`) is `stopped` only when `NSW` exceeds 1, fewer
+  than `NSW` ionic steps completed and `reached required accuracy` is absent;
+  otherwise the run finished anyway and keeps its classification;
+- a timeout, a stop diagnostic or a nonzero exit status keeps its own
+  classification; `stopped` takes precedence over `nonconverged` and over a missing
+  `OUTCAR` footer.
+
+The report member `soft_stop` records `mode`, `requested_at` (the epoch second the
+`STOPCAR` was written), `lead_seconds` (the deadline less `requested_at`) and
+`acknowledged` (`soft` or `hard`). {py:func}`~httk.codes.vasp.soft_stop_mintime`
+turns a `stopped` report into a `mintime` for the activation that resumes: twice
+the lead, at least one minute, as `H:MM:SS`, so a manager about to drain does not
+pick the job up again only to stop it at once.
+
+```python
+from httk.codes.vasp import contcar_to_poscar, run_vasp, soft_stop_mintime
+
+report = run_vasp(["vasp_std"], directory=workdir, soft_stop="ionic")
+if report.classification == "stopped":
+    contcar_to_poscar(workdir / "CONTCAR", reference=workdir / "POSCAR", output=workdir / "POSCAR")
+    mintime = soft_stop_mintime(report)
+```
+
+{py:func}`~httk.codes.vasp.contcar_to_poscar` replaces its output atomically, so
+an attempt stopped while promoting leaves either structure, never half of one.
+In Bash the option is `httk_vasp_run --soft-stop ionic -- vasp_std`, exit status
+`23` means `stopped`, and `httk_vasp_soft_stop_mintime [REPORT]` prints the
+duration or exits `1` with no output when there is none.
 
 ## Collect
 

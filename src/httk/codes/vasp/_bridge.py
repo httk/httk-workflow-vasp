@@ -46,6 +46,7 @@ from . import (
     update_incar,
     write_automatic_kpoints,
 )
+from .reports import _mintime
 
 
 def _remedy_history_default() -> str:
@@ -141,6 +142,7 @@ def add_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]"
     vasp_run.add_argument("--report", default="vasp-run-report.json")
     vasp_run.add_argument("--policy", default="")
     vasp_run.add_argument("--checker", action="append", default=[])
+    vasp_run.add_argument("--soft-stop", choices=("ionic", "electronic"), dest="soft_stop")
     vasp_run.add_argument("argv", nargs=argparse.REMAINDER)
     diagnose = commands.add_parser("vasp-diagnose")
     diagnose.add_argument("--directory", default=".")
@@ -155,6 +157,8 @@ def add_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]"
     remedy_apply.add_argument("decision")
     remedy_apply.add_argument("--directory", default=".")
     remedy_apply.add_argument("--history", default=_remedy_history_default())
+    mintime = commands.add_parser("vasp-soft-stop-mintime")
+    mintime.add_argument("report", nargs="?", default="vasp-run-report.json")
     report_problems = commands.add_parser("vasp-report-problems")
     report_problems.add_argument("report")
     remedy_reapply = commands.add_parser("vasp-remedy-reapply")
@@ -297,12 +301,14 @@ def run_command(arguments: argparse.Namespace) -> int:
             dispatch=arguments.dispatch,
             policy=arguments.policy,
             checkers=read_checker_specs(arguments.checker, base=Path.cwd()),
+            soft_stop=arguments.soft_stop,
         )
         return {
             "completed": 0,
             "diagnosed_stop": 20,
             "nonconverged": 21,
             "process_failure": 22,
+            "stopped": 23,
             "timeout": 124,
         }[report.classification]
     elif command == "vasp-diagnose":
@@ -337,6 +343,12 @@ def run_command(arguments: argparse.Namespace) -> int:
             # an attempt so the utility still runs by hand outside one.
             durable=os.environ.get("HTTK_WORKFLOW_DURABLE") == "1",
         )
+    elif command == "vasp-soft-stop-mintime":
+        saved = read_json(Path(arguments.report))
+        duration = _mintime(saved.get("classification"), saved.get("soft_stop"))
+        if duration is None:
+            return BRIDGE_ABSENT
+        print(duration)
     elif command == "vasp-report-problems":
         # dict.fromkeys: distinct codes in report order.
         codes = dict.fromkeys(

@@ -108,7 +108,7 @@ from .remedies import (
     remedy_policy,
     remedy_policy_names,
 )
-from .reports import VaspRunReport, read_checker_specs, run_vasp
+from .reports import VaspRunReport, read_checker_specs, run_vasp, soft_stop_mintime
 
 __all__ = [
     "DEFAULT_KPOINT_CENTERING",
@@ -155,6 +155,7 @@ __all__ = [
     "remedy_policy_names",
     "run_vasp",
     "scale_poscar_lattice",
+    "soft_stop_mintime",
     "suggested_magnetic_moments",
     "update_incar",
     "validate_vasp_workdir",

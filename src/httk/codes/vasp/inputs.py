@@ -550,7 +550,8 @@ def contcar_to_poscar(
     if not reference_lines or not lines:
         raise ValueError("CONTCAR and reference POSCAR must both be nonempty")
     destination = Path(output)
-    destination.write_text(reference_lines[0].rstrip("\r\n") + "\n" + "".join(lines[1:]), encoding="utf-8")
+    # Bytes as built, as before: the text writer would carry an existing output's CRLF line ends over.
+    _write_bytes_atomic(destination, (reference_lines[0].rstrip("\r\n") + "\n" + "".join(lines[1:])).encode("utf-8"))
     return destination
 
 
