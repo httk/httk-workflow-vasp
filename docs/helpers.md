@@ -137,8 +137,9 @@ comment's `[MAGMOM=...]`, else VASP's 1 per ion); `run`,
 `diagnose` and `report_problems` (which prints the distinct non-warning diagnostic
 codes of a run report, one per line); `soft_stop_mintime` (which prints the
 `mintime` to resume a soft-stopped run with, see [Soft stop](#soft-stop)); `remedy_plan`, `remedy_apply` and
-`remedy_reapply` (which prints the replayed changes as JSON); `preclean`,
-`clean_outcar`, `normalize_poscar`,
+`remedy_reapply` (which prints the replayed changes as JSON); `finalize` (see
+[Finalizing outputs](#finalizing-outputs)); `preclean`,
+`clean_outcar` (in place), `normalize_poscar`,
 `scale_poscar`, `rattle_poscar`, `promote_contcar`, and the energy, volume, POTIM,
 plane-wave and POTCAR-summary extractors. Each is one `vasp-*` bridge command, and
 every option of that command is available because arguments pass through
@@ -304,6 +305,86 @@ an attempt stopped while promoting leaves either structure, never half of one.
 In Bash the option is `httk_vasp_run --soft-stop ionic -- vasp_std`, exit status
 `23` means `stopped`, and `httk_vasp_soft_stop_mintime [REPORT]` prints the
 duration or exits `1` with no output when there is none.
+
+## Finalizing outputs
+
+A succeeded VASP job finalizes its outputs before it publishes them and
+succeeds, as *httk* v1 did at the end of a job:
+
+```python
+from httk.codes.vasp import finalize_job, find_output
+
+
+@run.step
+def finish(a):
+    finalize_job(a)
+    for name in ("CONTCAR", "OUTCAR", "vasprun.xml"):
+        if (path := find_output(a.workdir, name)) is not None:
+            a.put(path, path.name)
+    a.succeed()
+```
+
+{py:func}`~httk.codes.vasp.finalize_job` runs
+{py:func}`~httk.codes.vasp.finalize_outputs` on the workdir and the payload's
+`files/`:
+
+1. every `OUTCAR` in the workdir is cleaned in place by {py:func}`~httk.codes.vasp.clean_outcar`,
+   which removes the per-k-point eigenvalue/occupation blocks and the k-point
+   listings byte-for-byte as *httk* v1's `VASP_CLEAN_OUTCAR` did (marker lines
+   included); energies, structures, forces, stresses, magnetization and the
+   completion footer stay, so `OutcarFile` reads the same values;
+2. every `POTCAR` in either, a copyrighted file that must not be sealed or redistributed,
+   is replaced by {py:func}`~httk.codes.vasp.summarize_potcar` with
+   `POTCAR.summary` (its headers) and `POTCAR.sha256` (`sha256sum` format, so
+   `sha256sum -c POTCAR.sha256` verifies a reassembled POTCAR); a compressed
+   `POTCAR.gz` (or other suffix) is summarized and checksummed by its
+   decompressed bytes, and a `POTCAR` symlink by the file it points to, of
+   which only the link is removed. In the workdir the summary and checksum are
+   then compressed with everything else, so decompress them before checking
+   (`zstd -d POTCAR.sha256.zst`). A succeeded job therefore needs a POTCAR
+   again (library assembly or restaging) to be rerun;
+3. every other regular file in the workdir, WAVECAR, CHGCAR and CHG included, is
+   compressed, by default with Zstandard level 3 (`OUTCAR.zst`), with as many
+   workers as {py:func}`~httk.codes.vasp.default_compress_workers` finds in the
+   attempt's allocation on this host. An older compressed copy of a file being
+   compressed (an `OUTCAR.gz` beside a fresh `OUTCAR`) is removed, so readers
+   never find a stale one. Nothing in `files/` other than the POTCAR changes.
+   Dot files, symlinks and already compressed files are left alone.
+
+Every step is atomic and idempotent, so a finalization interrupted at any point
+completes when it runs again; the partial temporaries it left are removed
+then, and no other dot file is touched. Five settings, read through `Attempt.setting` (a
+job parameter, an `HTTK_VASP_*` variable, or a workspace setting), configure it:
+
+| Setting | Values | Default |
+|---|---|---|
+| `vasp.compress` | `zst`, `bz2`, `gz`, `xz`, `none` | `zst` |
+| `vasp.compress_level` | integer | the codec's (zst 3, bz2 9, gz 9, xz 6) |
+| `vasp.compress_workers` | positive integer | from the allocation |
+| `vasp.clean_outcar` | boolean (`true`/`false`, `yes`/`no`, `1`/`0`) | `true` |
+| `vasp.summarize_potcar` | boolean | `true` |
+
+A JSON `null`, or the string `null`, for any of them means unset, so the
+default applies.
+
+A Bash runner calls `httk_vasp_finalize`, which reads the same settings with
+`httk_workflow_setting` and produces the same files. It is the bridge command
+`vasp-finalize [--compress M] [--level N] [--workers N] [--no-clean-outcar]
+[--keep-potcar] [--compress-root DIR]... ROOT...` on the workdir and
+`$HTTK_WORKFLOW_JOB_DIR/files`. Since Bash API 6, `httk_vasp_clean_outcar
+[--path OUTCAR]` cleans in place, as `clean_outcar` does; its former
+`--output` option (which wrote `OUTCAR.cleaned`) was removed.
+
+Readers of a finalized job find files whether or not they were compressed:
+{py:func}`~httk.codes.vasp.find_output` returns `OUTCAR` or `OUTCAR.zst`,
+{py:func}`~httk.codes.vasp.read_output_bytes` and
+{py:func}`~httk.codes.vasp.read_output_text` decompress, and
+{py:func}`~httk.codes.vasp.copy_output` writes a plain copy (a WAVECAR seed for a
+follow-up calculation, say). The plain-text extractors
+(`last_oszicar_energy`, `last_vasprun_volume`, `outcar_potim`,
+`outcar_plane_wave_count`) and `contcar_to_poscar` read a compressed copy when
+the plain file is missing, and every *httk₂* reader (`httk.core.load`,
+`VASPOutputs`, collection) decompresses `.zst` transparently.
 
 ## Collect
 

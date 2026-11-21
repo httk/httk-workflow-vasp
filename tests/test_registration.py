@@ -10,7 +10,11 @@ from httk.core.register import code_support, known_codes
 
 def test_vasp_declares_its_application_settings() -> None:
     assert code_support("vasp").settings == (
+        "vasp.clean_outcar",
         "vasp.command",
+        "vasp.compress",
+        "vasp.compress_level",
+        "vasp.compress_workers",
         "vasp.diagnostic_policy",
         "vasp.gamma_command",
         "vasp.nbands_rounding",
@@ -18,6 +22,7 @@ def test_vasp_declares_its_application_settings() -> None:
         "vasp.parallelization",
         "vasp.potcar_variants",
         "vasp.pseudo_library",
+        "vasp.summarize_potcar",
     )
 
 

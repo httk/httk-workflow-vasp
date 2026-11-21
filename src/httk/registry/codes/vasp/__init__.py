@@ -7,7 +7,11 @@ register_code(
     bridge="httk.codes.vasp._bridge",
     bash_api="httk.codes.vasp:httk-vasp.sh",
     settings=(
+        "vasp.clean_outcar",
         "vasp.command",
+        "vasp.compress",
+        "vasp.compress_level",
+        "vasp.compress_workers",
         "vasp.diagnostic_policy",
         "vasp.gamma_command",
         "vasp.nbands_rounding",
@@ -15,6 +19,7 @@ register_code(
         "vasp.parallelization",
         "vasp.potcar_variants",
         "vasp.pseudo_library",
+        "vasp.summarize_potcar",
     ),
 )
 register_collector("vasp.calculation.relax", package="httk.codes.vasp:collectors/vasp-relax")

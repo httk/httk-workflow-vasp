@@ -538,6 +538,8 @@ def contcar_to_poscar(
 ) -> Path:
     """Replace CONTCAR's comment with the reference POSCAR comment.
 
+    A missing CONTCAR or reference is read from its compressed copy.
+
     :param contcar: Read the relaxed structure from this CONTCAR path.
     :param reference: Read the replacement comment from this POSCAR path.
     :param output: Write the resulting POSCAR to this path.
@@ -545,8 +547,10 @@ def contcar_to_poscar(
     :raises ValueError: If either input file is empty.
     """
 
-    reference_lines = Path(reference).read_text(encoding="utf-8").splitlines(keepends=True)
-    lines = Path(contcar).read_text(encoding="utf-8").splitlines(keepends=True)
+    from .archive import _read_text  # deferred: archive imports this module
+
+    reference_lines = _read_text(Path(reference)).splitlines(keepends=True)
+    lines = _read_text(Path(contcar)).splitlines(keepends=True)
     if not reference_lines or not lines:
         raise ValueError("CONTCAR and reference POSCAR must both be nonempty")
     destination = Path(output)
@@ -680,6 +684,11 @@ def rattle_poscar(
     return destination
 
 
+#: Every atomic writer's temporary is ``.<name>.<8 random characters>`` plus this suffix, so
+#: :func:`httk.codes.vasp.finalize_outputs` can recognize and remove one a crash left behind.
+_TEMPORARY_SUFFIX = ".httk-tmp"
+
+
 def _write_text_atomic(path: Path, value: str) -> None:
     """Atomically replace ``path`` with ``value``, keeping an existing file's mode and CRLF line ends."""
 
@@ -697,7 +706,7 @@ def _write_bytes_atomic(path: Path, data: bytes) -> None:
         mode = stat.S_IMODE(path.stat().st_mode)
     except FileNotFoundError:
         mode = 0o666 & ~_umask()
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=_TEMPORARY_SUFFIX, dir=path.parent)
     temporary = Path(temporary_name)
     try:
         os.fchmod(descriptor, mode)
@@ -818,7 +827,14 @@ def potcar_summary(
     :return: The written summary path.
     """
 
-    text = Path(path).read_text(encoding="utf-8", errors="replace")
+    destination = Path(output)
+    _write_text_atomic(destination, _potcar_summary_text(Path(path).read_text(encoding="utf-8", errors="replace")))
+    return destination
+
+
+def _potcar_summary_text(text: str) -> str:
+    """Return the :func:`potcar_summary` of POTCAR ``text``."""
+
     blocks: list[str] = []
     for block in re.split(r"(?=^\s*TITEL\s*=)", text, flags=re.MULTILINE):
         if "TITEL" not in block:
@@ -829,9 +845,7 @@ def potcar_summary(
                 keep.append(line.rstrip())
         if keep:
             blocks.append("\n".join(keep))
-    destination = Path(output)
-    _write_text_atomic(destination, "\n\n".join(blocks) + ("\n" if blocks else ""))
-    return destination
+    return "\n\n".join(blocks) + ("\n" if blocks else "")
 
 
 @dataclass(frozen=True)

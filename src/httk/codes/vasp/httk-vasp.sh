@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Native httk VASP Bash API, version 4. Source httk-workflow.sh first.
+# Native httk VASP Bash API, version 6. Source httk-workflow.sh first.
 #
 # Every function is one bridge subcommand, and every option of that subcommand is
 # available here: the arguments are passed through untouched. Version 2 keeps that
@@ -34,7 +34,15 @@
 # 23 (stopped by a STOPCAR, resumable) or 124 (timeout). It also adds
 # httk_vasp_soft_stop_mintime [REPORT=vasp-run-report.json], which prints the
 # mintime to resume a stopped run with, or exits 1 with no output when there is none.
-HTTK_VASP_BASH_API_VERSION=5
+#
+# Version 6 adds httk_vasp_finalize, which finalizes a succeeded job's outputs
+# exactly as the Python finalize_job: it cleans OUTCAR, replaces every POTCAR (in
+# the workdir and the payload's files/) by POTCAR.summary and POTCAR.sha256, and
+# compresses everything in the workdir, configured by the settings vasp.compress,
+# vasp.compress_level, vasp.compress_workers, vasp.clean_outcar and
+# vasp.summarize_potcar. httk_vasp_clean_outcar [--path OUTCAR] now cleans in
+# place, byte-for-byte as httk v1's VASP_CLEAN_OUTCAR; it no longer takes --output.
+HTTK_VASP_BASH_API_VERSION=6
 
 _httk_vasp_require_workflow_api() {
     if ! declare -F _httk_workflow_bridge >/dev/null 2>&1; then
@@ -111,6 +119,36 @@ httk_vasp_potcar_summary() {
 httk_vasp_clean_outcar() {
     _httk_vasp_require_workflow_api || return
     _httk_workflow_bridge vasp-clean-outcar "$@"
+}
+
+httk_vasp_finalize() {
+    _httk_vasp_require_workflow_api || return
+    local name value status arguments=()
+    value=$(httk_workflow_setting vasp.compress zst) || return
+    # A JSON null (or the string "null") means unset, as in finalize_job: the default applies.
+    arguments+=(--compress "$([ "$value" = null ] && printf zst || printf '%s' "$value")")
+    for name in level workers; do
+        value=$(httk_workflow_setting "vasp.compress_$name") || {
+            status=$?
+            [ "$status" -eq 1 ] && continue
+            return "$status"
+        }
+        [ "$value" = null ] || arguments+=("--$name" "$value")
+    done
+    for name in clean_outcar summarize_potcar; do
+        value=$(httk_workflow_setting "vasp.$name" true) || return
+        [ "$value" = null ] && value=true
+        case "${value,,}" in
+            true | yes | 1) ;;
+            false | no | 0) arguments+=("$([ "$name" = clean_outcar ] && printf -- --no-clean-outcar || printf -- --keep-potcar)") ;;
+            *)
+                printf 'httk-workflow: setting vasp.%s must be true or false (or yes/no/1/0), got %s\n' "$name" "$value" >&2
+                return 2
+                ;;
+        esac
+    done
+    _httk_workflow_bridge vasp-finalize "${arguments[@]}" --compress-root "${HTTK_WORKFLOW_WORKDIR:?}" \
+        "$HTTK_WORKFLOW_WORKDIR" "${HTTK_WORKFLOW_JOB_DIR:?}/files"
 }
 
 httk_vasp_preclean() {

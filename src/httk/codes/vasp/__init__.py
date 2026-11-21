@@ -57,11 +57,21 @@ register_citation(
 )
 
 from . import collect as _collect  # noqa: F401
+from .archive import (
+    clean_outcar,
+    copy_output,
+    default_compress_workers,
+    finalize_job,
+    finalize_outputs,
+    find_output,
+    read_output_bytes,
+    read_output_text,
+    summarize_potcar,
+)
 from .diagnostics import (
     VASP_CHECKS,
     VASP_RESTART_ARTIFACTS,
     VaspCheck,
-    clean_outcar,
     clean_vasp_outputs,
     diagnose_vasp_files,
     last_oszicar_energy,
@@ -132,8 +142,13 @@ __all__ = [
     "clean_outcar",
     "clean_vasp_outputs",
     "contcar_to_poscar",
+    "copy_output",
+    "default_compress_workers",
     "derive_seed",
     "diagnose_vasp_files",
+    "finalize_job",
+    "finalize_outputs",
+    "find_output",
     "job_remedy_history_path",
     "last_oszicar_energy",
     "last_vasprun_volume",
@@ -148,6 +163,8 @@ __all__ = [
     "rattle_poscar",
     "read_checker_specs",
     "read_incar",
+    "read_output_bytes",
+    "read_output_text",
     "read_poscar_header",
     "reapply_vasp_remedies",
     "register_remedy_policy",
@@ -157,6 +174,7 @@ __all__ = [
     "scale_poscar_lattice",
     "soft_stop_mintime",
     "suggested_magnetic_moments",
+    "summarize_potcar",
     "update_incar",
     "validate_vasp_workdir",
     "write_automatic_kpoints",

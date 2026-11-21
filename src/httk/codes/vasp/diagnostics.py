@@ -14,9 +14,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from httk.core.datastream.compression import split_compression_suffix
 from httk.workflow.codes import Diagnostic
 
-from .inputs import _write_text_atomic
+from .archive import _read_text
 
 #: Outputs :func:`clean_vasp_outputs` keeps unless they are named explicitly:
 #: the remedy machinery and restart promotion read exactly these two files.
@@ -26,13 +27,13 @@ VASP_RESTART_ARTIFACTS: tuple[str, ...] = ("CONTCAR", "vasp-run-report.json")
 def last_oszicar_energy(path: str | os.PathLike[str] = "OSZICAR") -> float | None:
     """Return the final ``E0`` value, or ``None`` when it is absent.
 
-    :param path: Read the OSZICAR file at this path.
+    :param path: Read the OSZICAR file at this path, or its compressed copy when it is missing.
     :return: The final parsed ``E0`` value, or ``None`` when no value is found.
     """
 
     found: float | None = None
     pattern = re.compile(r"\bE0=\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?)")
-    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in _read_text(Path(path), "replace").splitlines():
         match = pattern.search(line)
         if match is not None:
             found = float(match.group(1))
@@ -42,13 +43,13 @@ def last_oszicar_energy(path: str | os.PathLike[str] = "OSZICAR") -> float | Non
 def last_vasprun_volume(path: str | os.PathLike[str] = "vasprun.xml") -> float | None:
     """Return the final volume reported by ``vasprun.xml``.
 
-    :param path: Read the vasprun XML file at this path.
+    :param path: Read the vasprun XML file at this path, or its compressed copy when it is missing.
     :return: The final parsed volume, or ``None`` when no volume is found.
     """
 
     found: float | None = None
     pattern = re.compile(r'<i\s+name=["\']volume["\']>\s*([-+0-9.Ee]+)\s*</i>')
-    for match in pattern.finditer(Path(path).read_text(encoding="utf-8", errors="replace")):
+    for match in pattern.finditer(_read_text(Path(path), "replace")):
         found = float(match.group(1))
     return found
 
@@ -56,13 +57,13 @@ def last_vasprun_volume(path: str | os.PathLike[str] = "vasprun.xml") -> float |
 def outcar_potim(path: str | os.PathLike[str] = "OUTCAR") -> float | None:
     """Return the last optimizer step size from OUTCAR.
 
-    :param path: Read the OUTCAR file at this path.
+    :param path: Read the OUTCAR file at this path, or its compressed copy when it is missing.
     :return: The last parsed optimizer step size, or ``None`` when absent.
     """
 
     found: float | None = None
     pattern = re.compile(r"^\s*opt step\s*=\s*([-+0-9.Ee]+)", re.MULTILINE)
-    for match in pattern.finditer(Path(path).read_text(encoding="utf-8", errors="replace")):
+    for match in pattern.finditer(_read_text(Path(path), "replace")):
         found = float(match.group(1))
     return found
 
@@ -70,52 +71,16 @@ def outcar_potim(path: str | os.PathLike[str] = "OUTCAR") -> float | None:
 def outcar_plane_wave_count(path: str | os.PathLike[str] = "OUTCAR") -> int | None:
     """Return OUTCAR's maximum plane-wave count.
 
-    :param path: Read the OUTCAR file at this path.
+    :param path: Read the OUTCAR file at this path, or its compressed copy when it is missing.
     :return: The parsed maximum plane-wave count, or ``None`` when absent.
     """
 
     match = re.search(
         r"^\s*maximum number of plane-waves\s*:\s*([0-9]+)",
-        Path(path).read_text(encoding="utf-8", errors="replace"),
+        _read_text(Path(path), "replace"),
         re.MULTILINE,
     )
     return None if match is None else int(match.group(1))
-
-
-def clean_outcar(
-    path: str | os.PathLike[str] = "OUTCAR",
-    output: str | os.PathLike[str] = "OUTCAR.cleaned",
-) -> Path:
-    """Remove the largest reproducible k-point detail blocks from OUTCAR.
-
-    :param path: Read the OUTCAR file at this path.
-    :param output: Write the cleaned OUTCAR to this path.
-    :return: The cleaned output path.
-    """
-
-    lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
-    result: list[str] = []
-    skipping = False
-    starts = (
-        "k-points in units of 2pi/SCALE and weight:",
-        "Following reciprocal coordinates:",
-        "Following cartesian coordinates:",
-        "k-points in reciprocal lattice and weights",
-    )
-    for line in lines:
-        stripped = line.strip()
-        if any(stripped.startswith(item) for item in starts) or re.match(r"^k-point\s+\d+\s+.*plane waves", stripped):
-            result.append("VASP_CLEAN_OUTCAR: removed k-point detail block")
-            skipping = True
-            continue
-        if skipping:
-            if not stripped:
-                skipping = False
-            continue
-        result.append(line)
-    destination = Path(output)
-    _write_text_atomic(destination, "\n".join(result) + "\n")
-    return destination
 
 
 def validate_vasp_workdir(
@@ -151,7 +116,8 @@ def clean_vasp_outputs(
     ``vasp-run-report.json`` — are kept even without *keep*, because they are what
     the remedy machinery and restart promotion read: a pre-run cleanup that
     deletes them destroys the evidence of the run it is cleaning up after. Name
-    them in *also_remove* to delete them anyway.
+    them in *also_remove* to delete them anyway. A compressed copy of a removed
+    output (``OUTCAR.zst``, ...) is removed with it.
 
     :param directory: Remove outputs from this directory.
     :param keep: Preserve these output names.
@@ -181,15 +147,22 @@ def clean_vasp_outputs(
         "vasp.err",
         "vasp-run-report.json",
     )
+    compressed: dict[str, list[Path]] = {}
+    for entry in sorted(root.iterdir()) if root.is_dir() else ():
+        inner, codec = split_compression_suffix(entry.name)
+        if codec is not None:
+            compressed.setdefault(inner, []).append(entry)
     removed: list[Path] = []
     for name in names:
-        path = root / name
-        if name in retained or not path.exists():
+        if name in retained:
             continue
-        if not path.is_file() or path.is_symlink():
-            raise ValueError(f"refusing to clean non-regular VASP output: {path}")
-        path.unlink()
-        removed.append(path)
+        for path in (root / name, *compressed.get(name, ())):
+            if not path.exists():
+                continue
+            if not path.is_file() or path.is_symlink():
+                raise ValueError(f"refusing to clean non-regular VASP output: {path}")
+            path.unlink()
+            removed.append(path)
     return tuple(removed)
 
 

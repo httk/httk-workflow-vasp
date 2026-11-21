@@ -27,6 +27,7 @@ from . import (
     clean_vasp_outputs,
     contcar_to_poscar,
     diagnose_vasp_files,
+    finalize_outputs,
     job_remedy_history_path,
     last_oszicar_energy,
     last_vasprun_volume,
@@ -46,6 +47,7 @@ from . import (
     update_incar,
     write_automatic_kpoints,
 )
+from .archive import COMPRESSION_METHODS
 from .reports import _mintime
 
 
@@ -115,7 +117,14 @@ def add_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]"
     summary.add_argument("--output", default="POTCAR.summary")
     clean = commands.add_parser("vasp-clean-outcar")
     clean.add_argument("--path", default="OUTCAR")
-    clean.add_argument("--output", default="OUTCAR.cleaned")
+    finalize = commands.add_parser("vasp-finalize")
+    finalize.add_argument("--compress", choices=COMPRESSION_METHODS, default="zst")
+    finalize.add_argument("--level", type=int)
+    finalize.add_argument("--workers", type=int)
+    finalize.add_argument("--no-clean-outcar", action="store_false", dest="clean_outcar")
+    finalize.add_argument("--keep-potcar", action="store_false", dest="summarize_potcar")
+    finalize.add_argument("--compress-root", action="append", default=[], dest="compress_roots")
+    finalize.add_argument("roots", nargs="+")
     preclean = commands.add_parser("vasp-preclean")
     preclean.add_argument("--directory", default=".")
     preclean.add_argument("--keep", action="append", default=[])
@@ -270,7 +279,17 @@ def run_command(arguments: argparse.Namespace) -> int:
     elif command == "vasp-potcar-summary":
         potcar_summary(arguments.path, arguments.output)
     elif command == "vasp-clean-outcar":
-        clean_outcar(arguments.path, arguments.output)
+        clean_outcar(arguments.path)
+    elif command == "vasp-finalize":
+        finalize_outputs(
+            *arguments.roots,
+            compress=arguments.compress,
+            level=arguments.level,
+            workers=arguments.workers,
+            clean_outcar=arguments.clean_outcar,
+            summarize_potcar=arguments.summarize_potcar,
+            compress_roots=arguments.compress_roots or None,
+        )
     elif command == "vasp-preclean":
         for removed in clean_vasp_outputs(arguments.directory, keep=arguments.keep, also_remove=arguments.also_remove):
             print(removed)
