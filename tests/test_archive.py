@@ -2,6 +2,7 @@
 
 import bz2
 import gzip
+import hashlib
 import json
 import os
 import shutil
@@ -16,6 +17,7 @@ from typing import Any
 
 import pytest
 from httk.core.datastream.compression import open_compressed
+from httk.workflow.runtime_utils import read_digest_manifest
 
 from httk.codes.vasp import (
     clean_outcar,
@@ -345,8 +347,11 @@ def test_finalize_outputs_end_state_and_crash_resume(tmp_path: Path) -> None:
         "run/POTCAR.sha256.zst",
         "run/WAVECAR.zst",
         "run/INCAR.zst",
+        "run/uncompressed.sha256",
         "run/relax/OUTCAR.zst",
+        "run/relax/uncompressed.sha256",
         "run/relax/sub/OSZICAR.zst",
+        "run/relax/sub/uncompressed.sha256",
         "run/relax/CHGCAR.bz2",
         "run/.dotfile",
         "run/.hidden/OUTCAR",
@@ -366,11 +371,22 @@ def test_finalize_outputs_end_state_and_crash_resume(tmp_path: Path) -> None:
     assert bz2.decompress((run / "relax" / "CHGCAR.bz2").read_bytes()) == b"charge"
     assert (run / "link").is_symlink() and os.readlink(run / "link") == str(run / "INCAR")
     assert zstd.decompress((run / "INCAR.zst").read_bytes()) == b"ENCUT = 520\n"
+    # The plain digest manifest lists the uncompressed content of every file compressed there: the
+    # cleaned OUTCAR and the POTCAR summaries included; the pre-compressed CHGCAR.bz2 is not listed.
+    manifest = read_digest_manifest(run)
+    assert set(manifest) == {"OUTCAR", "POTCAR.summary", "POTCAR.sha256", "WAVECAR", "INCAR"}
+    for name, digest in manifest.items():
+        assert digest == hashlib.sha256(zstd.decompress((run / f"{name}.zst").read_bytes())).hexdigest()
+    assert manifest["OUTCAR"] == hashlib.sha256(outcar).hexdigest()
+    assert set(read_digest_manifest(run / "relax")) == {"OUTCAR"}
+    manifest_bytes = (run / "uncompressed.sha256").read_bytes()
+    assert manifest_bytes.decode().endswith("  WAVECAR\n")  # plain sha256sum text, not compressed
     finished = _listing(root)
 
     # Idempotent once done.
     finalize_outputs(run, files, compress_roots=(run,), workers=2)
     assert _listing(root) == finished
+    assert (run / "uncompressed.sha256").read_bytes() == manifest_bytes
 
     # Crash resume: a file left beside its compressed copy, and a summarized but not removed POTCAR.
     crashed = _tree(tmp_path / "crashed")
@@ -390,6 +406,7 @@ def test_finalize_outputs_removes_only_its_own_stale_temporaries(tmp_path: Path)
     # What a killed finalization leaves: a partial compressed WAVECAR and an atomic writer's temporary.
     (run / f".WAVECAR.zst.{os.getpid() + 1}.tmp").write_bytes(b"partial")
     (run / "relax" / ".CHGCAR.bz2.77.tmp").write_bytes(b"partial")
+    (run / f".uncompressed.sha256.{os.getpid() + 1}.tmp").write_bytes(b"partial")
     _, writer = tempfile.mkstemp(prefix=".OUTCAR.", suffix=_TEMPORARY_SUFFIX, dir=run)
     # ... and in a root that is not an output root, as a crash in summarize_potcar on files/ leaves.
     _, summary_writer = tempfile.mkstemp(prefix=".POTCAR.summary.", suffix=_TEMPORARY_SUFFIX, dir=files)
@@ -397,6 +414,7 @@ def test_finalize_outputs_removes_only_its_own_stale_temporaries(tmp_path: Path)
     kept = [
         run / ".dotfile",
         run / ".WAVECAR.zst.tmp",  # no pid: not compress_files' name
+        run / ".uncompressed.sha256.tmp",  # no pid: not the manifest writer's name
         run / ".notes.lz4.12.tmp",  # not a compress_files codec
         run / ".OUTCAR.short.httk-tmp",  # not 8 tempfile characters
         run / ".hidden" / ".WAVECAR.zst.12.tmp",  # inside a dot directory
@@ -409,6 +427,7 @@ def test_finalize_outputs_removes_only_its_own_stale_temporaries(tmp_path: Path)
     assert not (files / ".POSCAR.zst.12.tmp").exists()
     assert not (run / f".WAVECAR.zst.{os.getpid() + 1}.tmp").exists()
     assert not (run / "relax" / ".CHGCAR.bz2.77.tmp").exists()
+    assert not (run / f".uncompressed.sha256.{os.getpid() + 1}.tmp").exists()
     assert all(path.exists() for path in kept)
     assert (run / "WAVECAR.zst").exists()
 
@@ -422,7 +441,7 @@ def test_compression_replaces_stale_compressed_siblings(tmp_path: Path) -> None:
     (run / "OUTCAR.zst").write_bytes(b"partial")
     (run / "CHGCAR.bz2").write_bytes(bz2.compress(b"only copy"))
     finalize_outputs(run, workers=1)
-    assert sorted(path.name for path in run.iterdir()) == ["CHGCAR.bz2", "OUTCAR.zst"]
+    assert sorted(path.name for path in run.iterdir()) == ["CHGCAR.bz2", "OUTCAR.zst", "uncompressed.sha256"]
     assert find_output(run, "OUTCAR") == run / "OUTCAR.zst"
     assert read_output_text(run, "OUTCAR") == " fresh\n"
 
@@ -468,7 +487,7 @@ def test_finalize_outputs_options(tmp_path: Path) -> None:
     finalize_outputs(root / "run", root / "files", compress="none", summarize_potcar=False)
     assert (root / "run" / "POTCAR").read_text() == _POTCAR and (root / "files" / "POTCAR").exists()
     assert b"VASP_CLEAN_OUTCAR" in (root / "run" / "OUTCAR").read_bytes()
-    assert not list(root.rglob("*.zst"))
+    assert not list(root.rglob("*.zst")) and not list(root.rglob("uncompressed.sha256"))
 
     root = _tree(tmp_path / "limited")
     finalize_outputs(root / "run", root / "files", compress="bz2", clean_outcar=False, workers=1)
@@ -640,7 +659,7 @@ def test_compression_aware_readers(tmp_path: Path) -> None:
     (tmp_path / "POSCAR.ref").write_text("Si reference\n1.0\n")
     (tmp_path / "WAVECAR").write_bytes(b"\x00\x01binary")
     finalize_outputs(tmp_path, workers=1)
-    assert not [path for path in tmp_path.iterdir() if path.suffix != ".zst"]
+    assert not [path for path in tmp_path.iterdir() if path.suffix != ".zst" and path.name != "uncompressed.sha256"]
 
     assert last_oszicar_energy(tmp_path / "OSZICAR") == -10.5
     assert last_vasprun_volume(tmp_path / "vasprun.xml") == 8.0

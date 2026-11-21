@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, cast
 
 from httk.core.datastream.compression import codec_for_name, open_compressed, split_compression_suffix
-from httk.workflow.runtime_utils import compress_files
+from httk.workflow.runtime_utils import DIGEST_MANIFEST_NAME, compress_files
 
 from .inputs import _TEMPORARY_SUFFIX, _potcar_summary_text, _umask, _write_bytes_atomic, _write_text_atomic
 
@@ -50,9 +50,14 @@ _LISTINGS = (
     (re.compile(rb"^ *k-point +[0-9*]* .* plane waves"), b"VASP_CLEAN_OUTCAR: Removed k-point plane wave data\n"),
 )
 _DASHES = re.compile(rb"^ *-----------------------------------")
-# The temporaries a crash can leave below a root: compress_files' ``.<NAME>.<ext>.<pid>.tmp``
-# and the atomic writers' ``.<NAME>.<8 tempfile characters>.httk-tmp``.
-_STALE_TEMPORARY = re.compile(r"\..+\.(?:bz2|gz|xz|zst)\.[0-9]+\.tmp|\..+\.[a-z0-9_]{8}" + re.escape(_TEMPORARY_SUFFIX))
+# The temporaries a crash can leave below a root: compress_files' ``.<NAME>.<ext>.<pid>.tmp`` and
+# ``.uncompressed.sha256.<pid>.tmp``, and the atomic writers' ``.<NAME>.<8 tempfile characters>.httk-tmp``.
+_STALE_TEMPORARY = re.compile(
+    r"\..+\.(?:bz2|gz|xz|zst)\.[0-9]+\.tmp|\."
+    + re.escape(DIGEST_MANIFEST_NAME)
+    + r"\.[0-9]+\.tmp|\..+\.[a-z0-9_]{8}"
+    + re.escape(_TEMPORARY_SUFFIX)
+)
 _BLANK = re.compile(rb"^ *$")
 
 
@@ -240,7 +245,10 @@ def finalize_outputs(
     ``POTCAR`` below any root, compressed or a symlink, is summarized
     (:func:`summarize_potcar`); and then every remaining regular file below the
     output roots whose name has no registered compression suffix is compressed,
-    replacing the original and any older compressed copy of it. So a root that
+    replacing the original and any older compressed copy of it. Each directory
+    with files compressed keeps an uncompressed ``uncompressed.sha256`` of their
+    uncompressed SHA-256 digests, which ``sha256sum -c`` checks after
+    decompression and the job seal covers like any other file. So a root that
     is not an output root, such as a job's staged ``files/``, only loses its
     POTCARs. Rerunning after a crash at any point completes the work: a file
     left beside its compressed copy is compressed again, and the partial
@@ -276,7 +284,7 @@ def finalize_outputs(
     if method is None:
         return
     files = _walk(outputs)
-    targets = [path for path in files if codec_for_name(path.name) is None]
+    targets = [path for path in files if codec_for_name(path.name) is None and path.name != DIGEST_MANIFEST_NAME]
     # A compressed sibling of a file about to be compressed is stale and would shadow the new copy in
     # find_output (which prefers the registry's earlier codecs); the plain file still holds the data.
     fresh = set(targets)
@@ -284,7 +292,9 @@ def finalize_outputs(
         inner, codec = split_compression_suffix(path.name)
         if codec is not None and path.with_name(inner) in fresh and path.name != f"{inner}.{method}":
             path.unlink()
-    compress_files(targets, method=method, level=level, workers=cast(int, workers), remove_source=True)
+    compress_files(
+        targets, method=method, level=level, workers=cast(int, workers), remove_source=True, record_digests=True
+    )
 
 
 def _bool_setting(name: str, value: object) -> bool:

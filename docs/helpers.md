@@ -349,7 +349,11 @@ def finish(a):
    attempt's allocation on this host. An older compressed copy of a file being
    compressed (an `OUTCAR.gz` beside a fresh `OUTCAR`) is removed, so readers
    never find a stale one. Nothing in `files/` other than the POTCAR changes.
-   Dot files, symlinks and already compressed files are left alone.
+   Dot files, symlinks and already compressed files are left alone. Each
+   directory with files compressed also gets a plain `uncompressed.sha256`
+   holding the SHA-256 of each file's uncompressed content (`sha256sum` format,
+   so `sha256sum -c uncompressed.sha256` checks the directory after
+   decompression); it is a payload file like any other, so the job seal covers it.
 
 Every step is atomic and idempotent, so a finalization interrupted at any point
 completes when it runs again; the partial temporaries it left are removed
