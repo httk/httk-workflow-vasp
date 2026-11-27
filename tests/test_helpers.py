@@ -11,6 +11,7 @@ from httk.codes.vasp import (
     automatic_kpoint_grid,
     contcar_to_poscar,
     last_oszicar_energy,
+    normalize_poscar_handedness,
     read_incar,
     read_poscar_header,
     soft_stop_mintime,
@@ -142,3 +143,55 @@ def test_soft_stop_mintime_doubles_the_lead() -> None:
     assert mintime("stopped", None) is None
     assert mintime("completed", 300.0) is None
     assert soft_stop_mintime(VaspRunReport(process, "stopped", ())) is None
+
+
+def _cartesian_sites(path: Path) -> list[tuple[float, ...]]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    lattice = [[float(value) for value in lines[index].split()] for index in range(2, 5)]
+    rows = [line.split()[:3] for line in lines[9:12]]
+    if lines[8].strip()[0] in "cCkK":
+        return [tuple(float(value) for value in row) for row in rows]
+    return [
+        tuple(sum(float(row[axis]) * lattice[axis][column] for axis in range(3)) for column in range(3)) for row in rows
+    ]
+
+
+def test_normalize_poscar_handedness_keeps_sites(tmp_path: Path) -> None:
+    body = """chiral
+1.0
+2.5 0.1 0
+0.3 3 0
+0.2 0.1 -4
+Si O
+1 2
+Selective dynamics
+{mode}
+0.1 0.2 0.3 T F T Si1
+-0.35 0.05 0.0 F F F O1
+0.7 -0.6 0.15 T T T O2
+"""
+    direct = tmp_path / "POSCAR"
+    direct.write_text(body.format(mode="Direct"), encoding="utf-8")
+    before = _cartesian_sites(direct)
+    normalize_poscar_handedness(direct)
+    lines = direct.read_text(encoding="utf-8").splitlines()
+    assert lines[2:5] == ["-2.5 -0.1 0", "-0.3 -3 0", "-0.2 -0.1 4"]
+    assert lines[9:12] == ["-0.1 -0.2 -0.3 T F T Si1", "0.35 -0.05 0.0 F F F O1", "-0.7 0.6 -0.15 T T T O2"]
+    lattice = read_poscar_header(direct).lattice
+    (a, b, c), (d, e, f), (g, h, i) = lattice
+    assert a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g) > 0
+    after = _cartesian_sites(direct)
+    assert all(
+        abs(a - b) < 1e-12 for old, new in zip(before, after, strict=True) for a, b in zip(old, new, strict=True)
+    )
+
+    cartesian = tmp_path / "CARTESIAN"
+    cartesian.write_text(body.format(mode="cartesian"), encoding="utf-8")
+    normalize_poscar_handedness(cartesian)
+    assert cartesian.read_text(encoding="utf-8").splitlines()[8:] == body.format(mode="cartesian").splitlines()[8:]
+
+    right = tmp_path / "RIGHT"
+    _poscar(right)
+    original = right.read_bytes()
+    normalize_poscar_handedness(right)
+    assert right.read_bytes() == original

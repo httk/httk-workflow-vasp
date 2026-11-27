@@ -559,11 +559,47 @@ def contcar_to_poscar(
     return destination
 
 
+def _position_rows(lines: Sequence[str], header: PoscarHeader) -> tuple[str, range]:
+    """Return a VASP-5 POSCAR's coordinate-mode line and the indices of its site rows."""
+
+    mode = 7
+    if len(lines) > mode and lines[mode].strip().lower().startswith("s"):
+        mode += 1
+    if len(lines) <= mode:
+        raise ValueError("POSCAR has no coordinate mode")
+    rows = range(mode + 1, mode + 1 + sum(header.counts))
+    if len(lines) < rows.stop:
+        raise ValueError("POSCAR has fewer coordinate rows than declared atoms")
+    return lines[mode], rows
+
+
+def _negated(lexeme: str) -> str:
+    """Return the decimal *lexeme* negated as text, leaving a zero as written."""
+
+    if float(lexeme) == 0:
+        return lexeme
+    if lexeme[0] in "+-":
+        return lexeme[1:] if lexeme[0] == "-" else f"-{lexeme[1:]}"
+    return f"-{lexeme}"
+
+
 def normalize_poscar_handedness(path: str | os.PathLike[str] = "POSCAR") -> Path:
     """Make a left-handed POSCAR lattice right-handed without moving sites.
 
+    A lattice with a negative determinant has its three rows negated, which
+    makes it right-handed; in ``Direct`` mode every site's three fractional
+    coordinates are negated too, so each Cartesian position is unchanged.
+    ``Cartesian`` sites are already independent of the lattice and stay as
+    written. Numbers are negated as text, so nothing is rounded, and trailing
+    tokens such as selective-dynamics flags are kept. Anything after the site
+    rows is copied verbatim: that is exact for Cartesian initial velocities, the
+    form VASP writes, but a lattice-velocity, ``Direct`` velocity or
+    predictor-corrector block is not transformed. A right-handed POSCAR is left
+    untouched.
+
     :param path: Normalize the POSCAR file at this path.
     :return: The normalized POSCAR path.
+    :raises ValueError: If the POSCAR or one of its site rows is malformed.
     """
 
     destination = Path(path)
@@ -572,9 +608,17 @@ def normalize_poscar_handedness(path: str | os.PathLike[str] = "POSCAR") -> Path
     determinant = _dot(header.lattice[0], _cross(header.lattice[1], header.lattice[2]))
     if determinant >= 0:
         return destination
-    for index in range(2, 5):
-        values = [-float(item) for item in lines[index].split()]
-        lines[index] = " ".join(f"{value:.16g}" for value in values)
+    mode, rows = _position_rows(lines, header)
+    # ponytail: trailing velocity/predictor blocks are copied as is; transform them if a
+    # left-handed MD restart with lattice or Direct velocities ever has to be normalized.
+    for index in [*range(2, 5), *(rows if mode.strip()[:1].lower() not in ("c", "k") else ())]:
+        fields = lines[index].split()
+        if len(fields) < 3:
+            raise ValueError(f"invalid POSCAR row {index + 1}")
+        try:
+            lines[index] = " ".join([*(_negated(field) for field in fields[:3]), *fields[3:]])
+        except ValueError as exc:
+            raise ValueError(f"invalid POSCAR row {index + 1}") from exc
     _write_text_atomic(destination, "\n".join(lines) + "\n")
     return destination
 
@@ -664,17 +708,9 @@ def rattle_poscar(
     destination = Path(path)
     lines = destination.read_text(encoding="utf-8").splitlines()
     header = read_poscar_header(destination)
-    coordinate_start = 7
-    if len(lines) > coordinate_start and lines[coordinate_start].strip().lower().startswith("s"):
-        coordinate_start += 1
-    if len(lines) <= coordinate_start:
-        raise ValueError("POSCAR has no coordinate mode")
-    coordinate_start += 1
-    total = sum(header.counts)
-    if len(lines) < coordinate_start + total:
-        raise ValueError("POSCAR has fewer coordinate rows than declared atoms")
+    _, rows = _position_rows(lines, header)
     generator = random.Random(seed)
-    for index in range(coordinate_start, coordinate_start + total):
+    for index in rows:
         fields = lines[index].split()
         if len(fields) < 3:
             raise ValueError(f"invalid POSCAR coordinate row {index + 1}")
